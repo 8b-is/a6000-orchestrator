@@ -76,13 +76,19 @@ pub const UPDATED_8B_REPOS: [&str; 13] = [
 // ============================================================================
 
 /// Euclidean greatest common divisor over `i64` (always positive).
-pub const fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
-    if a < 0 {
-        a = a.saturating_neg();
+pub const fn gcd_i64(a: i64, b: i64) -> i64 {
+    let ua = a.unsigned_abs() as u128;
+    let ub = b.unsigned_abs() as u128;
+    let g = gcd_u128(ua, ub);
+    if g > (i64::MAX as u128) {
+        i64::MAX
+    } else {
+        g as i64
     }
-    if b < 0 {
-        b = b.saturating_neg();
-    }
+}
+
+/// Euclidean greatest common divisor over `u64` (always `>= 1`).
+pub const fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let r = a % b;
         a = b;
@@ -91,8 +97,8 @@ pub const fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
     if a == 0 { 1 } else { a }
 }
 
-/// Euclidean greatest common divisor over `u64` (always `>= 1`).
-pub const fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+/// Euclidean greatest common divisor over `u128` (always `>= 1`).
+pub const fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
     while b != 0 {
         let r = a % b;
         a = b;
@@ -119,17 +125,44 @@ impl Rational {
     pub const ONE: Self = Self { p: 1, q: 1 };
     pub const HUNDRED: Self = Self { p: 100, q: 1 };
 
-    /// Construct and reduce `p/q` via `gcd_i64`. If `q == 0`, clamps denominator to `1`.
-    pub const fn new(mut p: i64, mut q: i64) -> Self {
+    /// Construct and reduce `p/q` via `i128` / `gcd_u128`. If `q == 0`, clamps denominator to `1`.
+    pub const fn new(p: i64, q: i64) -> Self {
+        Self::from_i128(p as i128, q as i128)
+    }
+
+    /// Construct and reduce `p/q` from `i128`, scaling down proportionally if reduced components
+    /// exceed `i64::MAX` so ratio fidelity is preserved without independent `i64` saturation.
+    pub const fn from_i128(mut p: i128, mut q: i128) -> Self {
         if q == 0 {
             return Self { p: 0, q: 1 };
         }
         if q < 0 {
-            p = p.saturating_neg();
-            q = q.saturating_neg();
+            p = -p;
+            q = -q;
         }
-        let g = gcd_i64(p, q);
-        Self { p: p / g, q: q / g }
+        let g = gcd_u128(p.unsigned_abs(), q.unsigned_abs());
+        let mut rp = p / (g as i128);
+        let mut rq = q / (g as i128);
+        if rq < 1 {
+            rq = 1;
+        }
+        while rp.unsigned_abs() > (i64::MAX as u128) || rq.unsigned_abs() > (i64::MAX as u128) {
+            rp /= 2;
+            rq /= 2;
+            if rq < 1 {
+                rq = 1;
+            }
+            let g2 = gcd_u128(rp.unsigned_abs(), rq.unsigned_abs());
+            rp /= g2 as i128;
+            rq /= g2 as i128;
+            if rq < 1 {
+                rq = 1;
+            }
+        }
+        Self {
+            p: rp as i64,
+            q: rq as i64,
+        }
     }
 
     pub const fn from_int(n: i64) -> Self {
@@ -137,49 +170,64 @@ impl Rational {
     }
 
     pub const fn from_u64(num: u64, den: u64) -> Self {
+        Self::from_u128(num as u128, den as u128)
+    }
+
+    pub const fn from_u128(num: u128, den: u128) -> Self {
         if den == 0 {
             return Self { p: 0, q: 1 };
         }
-        let g = gcd_u64(num, den);
-        let div_n = num / g;
-        let div_d = den / g;
-        let rn = if div_n > (i64::MAX as u64) {
-            i64::MAX
-        } else {
-            div_n as i64
-        };
-        let rd = if div_d == 0 {
-            1
-        } else if div_d > (i64::MAX as u64) {
-            i64::MAX
-        } else {
-            div_d as i64
-        };
-        Self::new(rn, rd)
+        let g = gcd_u128(num, den);
+        let mut rn = num / g;
+        let mut rd = den / g;
+        if rd < 1 {
+            rd = 1;
+        }
+        while rn > (i64::MAX as u128) || rd > (i64::MAX as u128) {
+            rn /= 2;
+            rd /= 2;
+            if rd < 1 {
+                rd = 1;
+            }
+            let g2 = gcd_u128(rn, rd);
+            rn /= g2;
+            rd /= g2;
+            if rd < 1 {
+                rd = 1;
+            }
+        }
+        Self {
+            p: rn as i64,
+            q: rd as i64,
+        }
     }
 
     pub const fn add(self, other: Self) -> Self {
-        let g = gcd_i64(self.q, other.q);
-        let left = self.p.saturating_mul(other.q / g);
-        let right = other.p.saturating_mul(self.q / g);
-        let den = (self.q / g).saturating_mul(other.q);
-        Self::new(left.saturating_add(right), den)
+        let g = gcd_u128(self.q.unsigned_abs() as u128, other.q.unsigned_abs() as u128) as i128;
+        let oq = (other.q as i128) / g;
+        let sq = (self.q as i128) / g;
+        let left = (self.p as i128).saturating_mul(oq);
+        let right = (other.p as i128).saturating_mul(sq);
+        let den = sq.saturating_mul(other.q as i128);
+        Self::from_i128(left.saturating_add(right), den)
     }
 
     pub const fn sub(self, other: Self) -> Self {
-        let g = gcd_i64(self.q, other.q);
-        let left = self.p.saturating_mul(other.q / g);
-        let right = other.p.saturating_mul(self.q / g);
-        let den = (self.q / g).saturating_mul(other.q);
-        Self::new(left.saturating_sub(right), den)
+        let g = gcd_u128(self.q.unsigned_abs() as u128, other.q.unsigned_abs() as u128) as i128;
+        let oq = (other.q as i128) / g;
+        let sq = (self.q as i128) / g;
+        let left = (self.p as i128).saturating_mul(oq);
+        let right = (other.p as i128).saturating_mul(sq);
+        let den = sq.saturating_mul(other.q as i128);
+        Self::from_i128(left.saturating_sub(right), den)
     }
 
     pub const fn mul(self, other: Self) -> Self {
-        let g1 = gcd_i64(self.p, other.q);
-        let g2 = gcd_i64(other.p, self.q);
-        let num = (self.p / g1).saturating_mul(other.p / g2);
-        let den = (self.q / g2).saturating_mul(other.q / g1);
-        Self::new(num, den)
+        let g1 = gcd_u128(self.p.unsigned_abs() as u128, other.q.unsigned_abs() as u128) as i128;
+        let g2 = gcd_u128(other.p.unsigned_abs() as u128, self.q.unsigned_abs() as u128) as i128;
+        let num = ((self.p as i128) / g1).saturating_mul((other.p as i128) / g2);
+        let den = ((self.q as i128) / g2).saturating_mul((other.q as i128) / g1);
+        Self::from_i128(num, den)
     }
 
     pub const fn div(self, other: Self) -> Self {
@@ -514,7 +562,8 @@ impl C64ByteRing {
             self.head = (self.head + 1) % Self::CAPACITY;
             if self.used < Self::CAPACITY {
                 self.used += 1;
-            } else if self.head == 0 {
+            }
+            if self.head == 0 {
                 self.wrap_count += 1;
             }
             self.total_bytes_written += 1;
@@ -522,6 +571,8 @@ impl C64ByteRing {
     }
 
     /// Read up to `max_lines` most recent complete lines from the `64 KB` ring.
+    /// When the `64 KB` page has wrapped (`self.used == Self::CAPACITY`), skips any partial
+    /// overwritten prefix before the first newline so only complete records are returned.
     pub fn recent_records(&self, max_lines: usize) -> Vec<String> {
         if self.used == 0 || max_lines == 0 {
             return Vec::new();
@@ -535,7 +586,20 @@ impl C64ByteRing {
         for i in 0..self.used {
             raw.push(self.mem[(start + i) % Self::CAPACITY]);
         }
-        let text = String::from_utf8_lossy(&raw);
+        let slice = if self.used == Self::CAPACITY {
+            if let Some(first_nl) = raw.iter().position(|&b| b == b'\n') {
+                if first_nl + 1 < raw.len() {
+                    &raw[(first_nl + 1)..]
+                } else {
+                    &raw[..]
+                }
+            } else {
+                &raw[..]
+            }
+        } else {
+            &raw[..]
+        };
+        let text = String::from_utf8_lossy(slice);
         let mut lines: Vec<String> = text
             .lines()
             .map(str::trim)
@@ -640,7 +704,7 @@ impl MarineIntDetector {
 
         let mut min_v = u64::MAX;
         let mut max_v = 0u64;
-        let mut sum_v = 0u64;
+        let mut sum_v = 0u128;
         for &s in samples {
             if s < min_v {
                 min_v = s;
@@ -648,9 +712,9 @@ impl MarineIntDetector {
             if s > max_v {
                 max_v = s;
             }
-            sum_v = sum_v.saturating_add(s);
+            sum_v = sum_v.saturating_add(s as u128);
         }
-        let mean_pq = Rational::from_u64(sum_v, samples.len() as u64);
+        let mean_pq = Rational::from_u128(sum_v, samples.len() as u128);
 
         if samples.len() < 2 {
             return MarineTimingSalience {
@@ -667,34 +731,34 @@ impl MarineIntDetector {
             };
         }
 
-        let mut sum_amp_jitter = Rational::ZERO;
-        let mut pair_count = 0u64;
+        let mut sum_amp_diff = 0u128;
+        let mut sum_amp_scale = 0u128;
         for win in samples.windows(2) {
             let a = win[0].max(1);
             let b = win[1].max(1);
-            let max_ab = a.max(b);
-            let diff = a.abs_diff(b);
-            sum_amp_jitter = sum_amp_jitter.add(Rational::from_u64(diff, max_ab));
-            pair_count += 1;
+            let max_ab = a.max(b) as u128;
+            let diff = a.abs_diff(b) as u128;
+            sum_amp_diff = sum_amp_diff.saturating_add(diff);
+            sum_amp_scale = sum_amp_scale.saturating_add(max_ab);
         }
-        let amplitude_jitter_pq = if pair_count > 0 {
-            sum_amp_jitter.div(Rational::from_u64(pair_count, 1))
+        let amplitude_jitter_pq = if sum_amp_scale > 0 {
+            Rational::from_u128(sum_amp_diff, sum_amp_scale)
         } else {
             Rational::ZERO
         };
 
-        let mut sum_period_jitter = Rational::ZERO;
-        let mut trip_count = 0u64;
+        let mut sum_period_diff = 0u128;
+        let mut sum_period_scale = 0u128;
         for win in samples.windows(3) {
             let d1 = win[1].abs_diff(win[0]);
             let d2 = win[2].abs_diff(win[1]);
-            let max_d = win[0].max(win[1]).max(win[2]).max(1);
-            let diff = d1.abs_diff(d2);
-            sum_period_jitter = sum_period_jitter.add(Rational::from_u64(diff, max_d));
-            trip_count += 1;
+            let max_d = win[0].max(win[1]).max(win[2]).max(1) as u128;
+            let diff = d1.abs_diff(d2) as u128;
+            sum_period_diff = sum_period_diff.saturating_add(diff);
+            sum_period_scale = sum_period_scale.saturating_add(max_d);
         }
-        let period_jitter_pq = if trip_count > 0 {
-            sum_period_jitter.div(Rational::from_u64(trip_count, 1))
+        let period_jitter_pq = if sum_period_scale > 0 {
+            Rational::from_u128(sum_period_diff, sum_period_scale)
         } else {
             amplitude_jitter_pq
         };
@@ -1331,20 +1395,30 @@ pub fn probe_loopback_http(port: u16, path: &str, timeout_ms: u64) -> (bool, u64
                 let elapsed = start.elapsed().as_micros() as u64;
                 return (false, elapsed.max(1), "write_error".to_string());
             }
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap_or(0);
+            let mut resp = Vec::with_capacity(2048);
+            let mut chunk = [0u8; 1024];
+            while resp.len() < 4096 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => resp.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
             let elapsed = start.elapsed().as_micros() as u64;
-            let text = String::from_utf8_lossy(&buf[..n]);
+            let text = String::from_utf8_lossy(&resp);
             let status_ok = text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200");
-            let body_preview = text
-                .split("\r\n\r\n")
-                .nth(1)
-                .unwrap_or("")
+            let raw_body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+            // Skip chunked transfer-encoding hex length prefix if present and collapse multiline JSON
+            let body_lines: Vec<&str> = raw_body
                 .lines()
-                .next()
-                .unwrap_or("")
-                .trim();
-            let clean_detail = truncate_utf8_bytes(body_preview, 96)
+                .map(str::trim)
+                .filter(|l| {
+                    !l.is_empty()
+                        && !(l.len() <= 6 && l.chars().all(|c| c.is_ascii_hexdigit()))
+                })
+                .collect();
+            let collapsed = body_lines.join(" ");
+            let clean_detail = truncate_utf8_bytes(&collapsed, 96)
                 .chars()
                 .map(|c| if c == '.' { '·' } else { c })
                 .collect::<String>();
@@ -1572,7 +1646,7 @@ pub struct RepoSyncEntry {
 
 /// Measure TCP connect latency in integer microseconds to `ip:22`.
 pub fn probe_tcp_rtt_us(ip: &str, port: u16, timeout_ms: u64) -> (bool, u64) {
-    let Ok(ip_addr) = ip.parse::< std::net::IpAddr>() else {
+    let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() else {
         return (false, 0);
     };
     let sock = SocketAddr::new(ip_addr, port);
@@ -1637,6 +1711,8 @@ pub struct G8tOrchestrationReport {
     pub agent_id: String,
     pub resonance_hz: u64,
     pub run_epoch_ns: u64,
+    pub leaderboard_fetched: bool,
+    pub leaderboard_capsule_count: usize,
     pub capsules_benchmarked: Vec<CapsuleBenchVoteRecord>,
     pub snapped_circuit_id: String,
     pub snapped_circuit_name: String,
@@ -1648,8 +1724,82 @@ pub struct G8tOrchestrationReport {
     pub overall_trit: Trit,
 }
 
-/// Execute the 3 canonical `g8t.is` capsules in-process for ultra-precise 8-window nanosecond
-/// benchmarking on the A6000 (`48`-vCPU Xeon).
+/// Production `g8t.is` capsule 1: `gaia_pack_trits_unrolled` (`919c37509f21ba416f9d7f7cc6bc63e6`, `(u64)->u64`).
+#[inline(never)]
+pub fn capsule_gaia_pack_trits_unrolled(word: u64) -> u64 {
+    const POW3: [u64; 5] = [1, 3, 9, 27, 81];
+    let mut byte_val: u64 = 0;
+    let mut slot: usize = 0;
+    while slot < 5 {
+        let raw = ((word >> (slot as u32 * 12)) & 0xFFF) as i64 - 2048;
+        let trit: i8 = (raw > 256) as i8 - (raw < -256) as i8;
+        let tu = trit as u8;
+        let digit = tu.wrapping_add((tu >> 7).wrapping_mul(3)) as u64;
+        byte_val += digit * POW3[slot];
+        slot += 1;
+    }
+    byte_val
+}
+
+/// Production `g8t.is` capsule 2: `memnet_wave_interference_step` (`816da5edf3e1d6cd1d57ec76ae6e5498`, `(u64)->i64`).
+#[inline(never)]
+pub fn capsule_memnet_wave_interference_step(wave_state: u64) -> i64 {
+    let n = ((wave_state & 0xFFFF) as i16) as i64;
+    let s = (((wave_state >> 16) & 0xFFFF) as i16) as i64;
+    let e = (((wave_state >> 32) & 0xFFFF) as i16) as i64;
+    let w = (((wave_state >> 48) & 0xFFFF) as i16) as i64;
+    let center = (n + s + e + w) >> 2;
+    let laplacian = (n + s + e + w) - (center * 4);
+    let stepped = center + (laplacian >> 1);
+    let damped = (stepped * 63) >> 6;
+    damped ^ 432
+}
+
+/// Production `g8t.is` capsule 3: `vaked_toss_spiral_fold` (`4d22589df15db2f08efbdafeb594fe1d`, `(i64)->i64`).
+#[inline(never)]
+pub fn capsule_vaked_toss_spiral_fold(coord: i64) -> i64 {
+    const SIN_Q8: [i64; 9] = [0, 165, 252, 222, 88, -88, -222, -252, -165];
+    const COS_Q8: [i64; 9] = [256, 196, 44, -128, -241, -241, -128, 44, 196];
+    let mut x: i64 = (coord & 0xFFFF) - 32768;
+    let mut y: i64 = ((coord >> 16) & 0xFFFF) - 32768;
+    let mut step: usize = 0;
+    while step < 9 {
+        let radius = ((step as i64) + 1) * 432;
+        let nx = ((x * COS_Q8[step] - y * SIN_Q8[step]) >> 8).wrapping_add(radius);
+        let ny = ((x * SIN_Q8[step] + y * COS_Q8[step]) >> 8).wrapping_sub(radius >> 1);
+        x = nx ^ (step as i64 * 137);
+        y = ny;
+        step += 1;
+    }
+    x.wrapping_add(y)
+}
+
+/// Production `g8t.is` capsule 4: `liquid_pcm16_to_mulaw` (`ec976a9db0b9a84affdfa0ce4e01ccdc`, `(i64)->u64`).
+#[inline(never)]
+pub fn capsule_liquid_pcm16_to_mulaw(pcm_sample: i64) -> u64 {
+    const BIAS: i64 = 132;
+    const CLIP: i64 = 32635;
+    let clamped = if pcm_sample > 32767 {
+        32767
+    } else if pcm_sample < -32768 {
+        -32768
+    } else {
+        pcm_sample
+    };
+    let sign: u64 = if clamped < 0 { 0x80 } else { 0x00 };
+    let mag = if clamped < 0 { -clamped } else { clamped };
+    let biased = (if mag > CLIP { CLIP } else { mag }) + BIAS;
+    let mut exp: u64 = 7;
+    let mut mask: i64 = 0x4000;
+    while exp > 0 && (biased & mask) == 0 {
+        exp -= 1;
+        mask >>= 1;
+    }
+    let mantissa = ((biased >> (exp + 3)) & 0x0F) as u64;
+    (!(sign | (exp << 4) | mantissa)) & 0xFF
+}
+
+/// Legacy helper capsules retained for backward compatibility.
 #[inline(never)]
 pub fn capsule_marine_salience_fold(signal: u64) -> u64 {
     let mut acc: u64 = signal ^ 432;
@@ -1685,7 +1835,7 @@ pub fn capsule_c64_ring_accumulate(trit: i64) -> i64 {
     sum
 }
 
-/// Benchmark one of the 3 `g8t.is` capsules across 8 sample windows and build a signed `AyeAttestation`.
+/// Benchmark one of the `g8t.is` capsules across 8 sample windows and build a signed `AyeAttestation`.
 pub fn benchmark_capsule_on_a6000(
     capsule_id: &str,
     fn_name: &str,
@@ -1703,9 +1853,14 @@ pub fn benchmark_capsule_on_a6000(
         let start = Instant::now();
         let mut s_acc: i64 = (w as i64) + 1;
         for i in 0..win_ops {
+            let arg_u64 = i.wrapping_add(w as u64).wrapping_mul(432);
             let v = match fn_name {
-                "marine_salience_fold" => capsule_marine_salience_fold(i.wrapping_add(w as u64)) as i64,
-                "balanced_ternary_step" => capsule_balanced_ternary_step(i.wrapping_add(w as u64)),
+                "gaia_pack_trits_unrolled" => capsule_gaia_pack_trits_unrolled(arg_u64) as i64,
+                "memnet_wave_interference_step" => capsule_memnet_wave_interference_step(arg_u64),
+                "vaked_toss_spiral_fold" => capsule_vaked_toss_spiral_fold((i as i64) ^ s_acc),
+                "liquid_pcm16_to_mulaw" => capsule_liquid_pcm16_to_mulaw((i as i64) + s_acc) as i64,
+                "marine_salience_fold" => capsule_marine_salience_fold(arg_u64) as i64,
+                "balanced_ternary_step" => capsule_balanced_ternary_step(arg_u64),
                 _ => capsule_c64_ring_accumulate((i as i64) + s_acc),
             };
             s_acc = s_acc.wrapping_add(v);
@@ -1972,10 +2127,25 @@ mod tests {
         assert_eq!(recs[0], "TICK:1:VRAM=1/49140");
         assert_eq!(recs[1], "TICK:2:SALIENCE=100/1");
         assert!(ring.used_bytes() > 0 && ring.used_bytes() < C64ByteRing::CAPACITY);
+
+        // Write > 65536 bytes to verify 64KB wrap-around and clean line boundaries
+        for idx in 0..2500 {
+            ring.write_record(&format!("WRAP_EVENT:{:04}:SALIENCE=100/1:C64=65536", idx));
+        }
+        assert_eq!(ring.used_bytes(), C64ByteRing::CAPACITY);
+        assert_eq!(ring.ram_ratio().to_string(), "1/1");
+        assert!(ring.wrap_count() >= 1);
+        let wrapped_recs = ring.recent_records(2500);
+        assert!(!wrapped_recs.is_empty());
+        assert!(wrapped_recs[0].starts_with("WRAP_EVENT:"));
+        assert_eq!(
+            wrapped_recs.last().unwrap(),
+            "WRAP_EVENT:2499:SALIENCE=100/1:C64=65536"
+        );
     }
 
     #[test]
-    fn test_marine_int_detector_timing_salience() {
+    fn test_marine_int_detector_timing_salience_and_64_samples() {
         let steady = [420u64, 420, 420, 420, 420, 420, 420, 420];
         let rep = MarineIntDetector::analyze_timing_ring(&steady);
         assert_eq!(rep.salience_pq.to_string(), "100/1");
@@ -1984,6 +2154,19 @@ mod tests {
         let jittery = [100u64, 5000, 120, 8000, 90, 9000, 110, 7500];
         let rep_j = MarineIntDetector::analyze_timing_ring(&jittery);
         assert_eq!(rep_j.stability_trit, Trit::Neg);
+
+        // Verify 64-sample ring of large coprime microsecond/nanosecond timings never overflows i64
+        let mut samples_64 = [0u64; 64];
+        for (i, slot) in samples_64.iter_mut().enumerate() {
+            *slot = 250_631 + ((i as u64 * 17) % 113);
+        }
+        let rep_64 = MarineIntDetector::analyze_timing_ring(&samples_64);
+        assert_eq!(rep_64.stability_trit, Trit::Pos);
+        assert!(
+            rep_64.salience_pq.ge_rational(Rational::from_int(99)),
+            "Expected >= 99/1 salience for low-jitter 64-sample ring, got {}",
+            rep_64.salience_pq
+        );
     }
 
     #[test]
@@ -2007,7 +2190,7 @@ mod tests {
             432,
             1_792_925_000_000_000_000,
             79,
-            b"VOTE:d7f5abd069142416edd1345dbfd16312:800000:2000000:6000000:256:250,250,250,250,250,250,250,250:1",
+            b"VOTE:919c37509f21ba416f9d7f7cc6bc63e6:800000:2000000:6000000:256:250,250,250,250,250,250,250,250:1",
             G8T_SOVEREIGN_SECRET,
         );
         assert_eq!(att.payload_blake3_hex.len(), 64);
@@ -2040,10 +2223,10 @@ mod tests {
 
     #[test]
     fn test_capsule_pipeline_execution() {
-        let s0 = capsule_marine_salience_fold(432);
-        let s1 = capsule_balanced_ternary_step(s0);
-        let s2 = capsule_c64_ring_accumulate(s1);
-        assert!(s1 >= -1 && s1 <= 1);
-        assert_eq!(s2, s1 + 1);
+        let s0 = capsule_gaia_pack_trits_unrolled(432);
+        let s1 = capsule_memnet_wave_interference_step(s0);
+        let s2 = capsule_vaked_toss_spiral_fold(s1);
+        let s3 = capsule_liquid_pcm16_to_mulaw(s2);
+        assert!(s3 <= 0xFF);
     }
 }

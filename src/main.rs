@@ -242,10 +242,75 @@ pub fn collect_status_report(state: &mut A6000OrchestratorState) -> A6000StatusR
     }
 }
 
+/// Query live storage vault GiB usage on `188.40.209.186` and `49.13.101.247`.
+fn refresh_storage_vaults_live(current: &[StorageVaultStatus]) -> Vec<StorageVaultStatus> {
+    let mut out = current.to_vec();
+    // 1. Check 188.40.209.186 (/data/8b-is and /data/git)
+    if let Ok(cmd) = Command::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=3",
+            "root@188.40.209.186",
+            "df -BG --output=size,used,avail /data/8b-is /data/git 2>/dev/null | tail -n +2",
+        ])
+        .output()
+    {
+        if cmd.status.success() {
+            let text = String::from_utf8_lossy(&cmd.stdout);
+            for (idx, line) in text.lines().take(2).enumerate() {
+                let nums: Vec<u64> = line
+                    .split_whitespace()
+                    .filter_map(|t| t.trim_end_matches('G').parse::<u64>().ok())
+                    .collect();
+                if nums.len() >= 3 {
+                    if let Some(v) = out.get_mut(idx) {
+                        v.total_gi_bytes = nums[0].max(1);
+                        v.used_gi_bytes = nums[1];
+                        v.free_gi_bytes = nums[2];
+                        v.usage_ratio = Rational::from_u64(v.used_gi_bytes, v.total_gi_bytes);
+                        v.health_trit = if v.free_gi_bytes > 100 {
+                            Trit::Pos
+                        } else {
+                            Trit::Zero
+                        };
+                    }
+                }
+            }
+        }
+    }
+    // 2. Check /data locally (or on 49.13.101.247)
+    if let Ok(cmd) = Command::new("df")
+        .args(["-BG", "--output=size,used,avail", "/data"])
+        .output()
+    {
+        if cmd.status.success() {
+            let text = String::from_utf8_lossy(&cmd.stdout);
+            if let Some(line) = text.lines().nth(1) {
+                let nums: Vec<u64> = line
+                    .split_whitespace()
+                    .filter_map(|t| t.trim_end_matches('G').parse::<u64>().ok())
+                    .collect();
+                if nums.len() >= 3 {
+                    if let Some(v) = out.get_mut(2) {
+                        v.total_gi_bytes = nums[0].max(1);
+                        v.used_gi_bytes = nums[1];
+                        v.free_gi_bytes = nums[2];
+                        v.usage_ratio = Rational::from_u64(v.used_gi_bytes, v.total_gi_bytes);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Subsystem B: Probe all 9 Hetzner servers + `5.78.220.57` (`ns3.i1.is`) in parallel.
 pub fn probe_all_fleet_nodes(state: &mut A6000OrchestratorState, include_ssh: bool) {
     let specs: Vec<FleetNodeSpec> = state.fleet_nodes.iter().map(|n| n.spec).collect();
-    let results: Vec<(usize, bool, u64, bool, u64)> = thread::scope(|s| {
+    let current_vaults = state.storage_vaults.clone();
+    let (results, updated_vaults) = thread::scope(|s| {
         let mut handles = Vec::with_capacity(specs.len());
         for spec in specs {
             handles.push(s.spawn(move || {
@@ -258,10 +323,19 @@ pub fn probe_all_fleet_nodes(state: &mut A6000OrchestratorState, include_ssh: bo
                 (spec.index, tcp_ok, rtt_us, ssh_ok, uptime_s)
             }));
         }
-        handles
+        let vault_handle = s.spawn(move || {
+            if include_ssh {
+                refresh_storage_vaults_live(&current_vaults)
+            } else {
+                current_vaults
+            }
+        });
+        let node_res: Vec<(usize, bool, u64, bool, u64)> = handles
             .into_iter()
             .filter_map(|h| h.join().ok())
-            .collect()
+            .collect();
+        let vaults = vault_handle.join().unwrap_or_default();
+        (node_res, vaults)
     });
 
     for (idx, tcp_ok, rtt_us, ssh_ok, uptime_s) in results {
@@ -275,6 +349,9 @@ pub fn probe_all_fleet_nodes(state: &mut A6000OrchestratorState, include_ssh: bo
             node.rtt_ring.push(rtt_us.max(1));
             node.salience = MarineIntDetector::analyze_timing_ring(&node.rtt_ring.to_vec());
         }
+    }
+    if !updated_vaults.is_empty() {
+        state.storage_vaults = updated_vaults;
     }
 
     state
@@ -355,32 +432,78 @@ pub fn sync_13_repos(state: &mut A6000OrchestratorState) -> (Vec<RepoSyncEntry>,
     (entries, elapsed_us)
 }
 
-/// Subsystem C: Run as `aye-a6000-prime` — benchmark `g8t.is` capsules, submit signed `AyeAttestation`
-/// speed votes (`POST https://g8t.is/g8t/capsules/vote`), compose & submit Snap-Circuit
-/// (`POST https://g8t.is/g8t/circuits/snap`), and compile/verify natively via `rustc`!
+/// Fetch `https://g8t.is/g8t/leaderboard` and count live capsules.
+fn fetch_g8t_leaderboard_status() -> (bool, usize) {
+    if let Ok(out) = Command::new("curl")
+        .args(["-sk", "--max-time", "4", "https://g8t.is/g8t/leaderboard"])
+        .output()
+    {
+        if out.status.success() {
+            let body = String::from_utf8_lossy(&out.stdout);
+            let count = body.matches("\"signature_key\":").count();
+            if count > 0 {
+                return (true, count);
+            }
+        }
+    }
+    (false, 9)
+}
+
+/// Subsystem C: Run as `aye-a6000-prime` — fetch `https://g8t.is/g8t/leaderboard`, benchmark the
+/// 4 production `g8t.is` pipeline capsules on the A6000 (`48`-vCPU Xeon + `RTX 6000 Ada`), submit
+/// signed `AyeAttestation` speed votes (`POST https://g8t.is/g8t/capsules/vote`), compose & submit
+/// the 4-stage Snap-Circuit (`POST https://g8t.is/g8t/circuits/snap`), and compile/verify natively via `rustc`!
 pub fn orchestrate_g8t_capsela(state: &mut A6000OrchestratorState) -> G8tOrchestrationReport {
+    let nonces = [
+        state.next_nonce(),
+        state.next_nonce(),
+        state.next_nonce(),
+        state.next_nonce(),
+        state.next_nonce(),
+    ];
+    let report = run_g8t_capsela_with_nonces(nonces);
+    state.c64_page.write_record(&format!(
+        "G8T_ORCHESTRATE:AGENT={}:CIRCUIT={}:OUT={}:RUSTC={}:SNAP_OK={}",
+        AYE_A6000_AGENT_ID,
+        report.snapped_circuit_name,
+        report.snapped_output_value,
+        report.rustc_native_verified,
+        report.remote_snap_accepted
+    ));
+    state.last_g8t_report = Some(report.clone());
+    report
+}
+
+fn run_g8t_capsela_with_nonces(nonces: [u64; 5]) -> G8tOrchestrationReport {
     let run_epoch_ns = now_epoch_ns();
+    let (leaderboard_fetched, leaderboard_capsule_count) = fetch_g8t_leaderboard_status();
+
     let capsules = [
         (
-            "d7f5abd069142416edd1345dbfd16312",
-            "marine_salience_fold",
+            "919c37509f21ba416f9d7f7cc6bc63e6",
+            "gaia_pack_trits_unrolled",
             "(u64)->u64",
         ),
         (
-            "5fb77c31ae5900c174f6d2758c8195e4",
-            "balanced_ternary_step",
+            "816da5edf3e1d6cd1d57ec76ae6e5498",
+            "memnet_wave_interference_step",
             "(u64)->i64",
         ),
         (
-            "2b1401e38d05d10a5b5ca0e9954ae213",
-            "c64_ring_accumulate",
+            "4d22589df15db2f08efbdafeb594fe1d",
+            "vaked_toss_spiral_fold",
             "(i64)->i64",
+        ),
+        (
+            "ec976a9db0b9a84affdfa0ce4e01ccdc",
+            "liquid_pcm16_to_mulaw",
+            "(i64)->u64",
         ),
     ];
 
-    let mut bench_records = Vec::with_capacity(3);
-    for (cap_id, fn_name, sig_key) in capsules {
-        let nonce = state.next_nonce();
+    let mut bench_records = Vec::with_capacity(4);
+    for (idx, (cap_id, fn_name, sig_key)) in capsules.into_iter().enumerate() {
+        let nonce = nonces[idx];
         let epoch_ns = now_epoch_ns();
         let (mut record, vote_json) =
             benchmark_capsule_on_a6000(cap_id, fn_name, sig_key, 50_000, epoch_ns, nonce);
@@ -409,14 +532,15 @@ pub fn orchestrate_g8t_capsela(state: &mut A6000OrchestratorState) -> G8tOrchest
         bench_records.push(record);
     }
 
-    // Build and submit signed Snap-Circuit composition to https://g8t.is/g8t/circuits/snap
+    // Build and submit signed 4-stage Snap-Circuit composition to https://g8t.is/g8t/circuits/snap
     let circuit_name = "a6000_sovereign_triad_pipeline";
     let cap_ids = [
-        "d7f5abd069142416edd1345dbfd16312",
-        "5fb77c31ae5900c174f6d2758c8195e4",
-        "2b1401e38d05d10a5b5ca0e9954ae213",
+        "919c37509f21ba416f9d7f7cc6bc63e6",
+        "816da5edf3e1d6cd1d57ec76ae6e5498",
+        "4d22589df15db2f08efbdafeb594fe1d",
+        "ec976a9db0b9a84affdfa0ce4e01ccdc",
     ];
-    let snap_nonce = state.next_nonce();
+    let snap_nonce = nonces[4];
     let snap_epoch_ns = now_epoch_ns();
     let (snap_json, snap_att) =
         build_snap_circuit_request_json(circuit_name, &cap_ids, snap_epoch_ns, snap_nonce);
@@ -451,18 +575,21 @@ pub fn orchestrate_g8t_capsela(state: &mut A6000OrchestratorState) -> G8tOrchest
         }
     }
 
-    // Native rustc compilation & execution on the A6000 (48-vCPU Xeon)
+    // Native rustc compilation & execution on the A6000 (48-vCPU Xeon) with isolated nonce temp path
     let input_seed: u64 = 432;
-    let s0 = capsule_marine_salience_fold(input_seed);
-    let s1 = capsule_balanced_ternary_step(s0);
-    let expected_out = capsule_c64_ring_accumulate(s1);
+    let s0 = capsule_gaia_pack_trits_unrolled(input_seed);
+    let s1 = capsule_memnet_wave_interference_step(s0);
+    let s2 = capsule_vaked_toss_spiral_fold(s1);
+    let expected_out = capsule_liquid_pcm16_to_mulaw(s2) as i64;
 
-    let (rustc_ok, native_ns) = compile_and_verify_native_snap(input_seed, expected_out);
+    let (rustc_ok, native_ns) = compile_and_verify_native_snap(input_seed, expected_out, snap_nonce);
 
-    let report = G8tOrchestrationReport {
+    G8tOrchestrationReport {
         agent_id: AYE_A6000_AGENT_ID.to_string(),
         resonance_hz: 432,
         run_epoch_ns,
+        leaderboard_fetched,
+        leaderboard_capsule_count,
         capsules_benchmarked: bench_records,
         snapped_circuit_id,
         snapped_circuit_name: circuit_name.to_string(),
@@ -471,85 +598,154 @@ pub fn orchestrate_g8t_capsela(state: &mut A6000OrchestratorState) -> G8tOrchest
         rustc_native_verified: rustc_ok,
         native_exec_ns: native_ns,
         remote_snap_accepted,
-        overall_trit: Trit::Pos,
-    };
-
-    state.c64_page.write_record(&format!(
-        "G8T_ORCHESTRATE:AGENT={}:CIRCUIT={}:OUT={}:RUSTC={}",
-        AYE_A6000_AGENT_ID, circuit_name, expected_out, rustc_ok
-    ));
-    state.last_g8t_report = Some(report.clone());
-    report
+        overall_trit: if rustc_ok && remote_snap_accepted {
+            Trit::Pos
+        } else if rustc_ok {
+            Trit::Zero
+        } else {
+            Trit::Neg
+        },
+    }
 }
 
-fn compile_and_verify_native_snap(seed: u64, expected_out: i64) -> (bool, u64) {
-    let src_path = "/tmp/a6000_snap_circuit.rs";
-    let bin_path = "/tmp/a6000_snap_circuit_bin";
+fn compile_and_verify_native_snap(seed: u64, expected_out: i64, nonce: u64) -> (bool, u64) {
+    let pid = std::process::id();
+    let src_path = format!("/tmp/a6000_snap_circuit_{}_{}.rs", pid, nonce);
+    let bin_path = format!("/tmp/a6000_snap_circuit_bin_{}_{}", pid, nonce);
     let code = format!(
         "#![forbid(unsafe_code)]\n\
-         pub fn marine_salience_fold(signal: u64) -> u64 {{\n\
-             let mut acc: u64 = signal ^ 432;\n\
-             let mut i: u64 = 0;\n\
-             while i < 8 {{ acc = acc.wrapping_mul(257).wrapping_add(i + 1); i += 1; }}\n\
-             acc\n\
+         pub fn gaia_pack_trits_unrolled(word: u64) -> u64 {{\n\
+             const POW3: [u64; 5] = [1, 3, 9, 27, 81];\n\
+             let mut byte_val: u64 = 0;\n\
+             let mut slot: usize = 0;\n\
+             while slot < 5 {{\n\
+                 let raw = ((word >> (slot as u32 * 12)) & 0xFFF) as i64 - 2048;\n\
+                 let trit: i8 = (raw > 256) as i8 - (raw < -256) as i8;\n\
+                 let tu = trit as u8;\n\
+                 let digit = tu.wrapping_add((tu >> 7).wrapping_mul(3)) as u64;\n\
+                 byte_val += digit * POW3[slot];\n\
+                 slot += 1;\n\
+             }}\n\
+             byte_val\n\
          }}\n\
-         pub fn balanced_ternary_step(folded: u64) -> i64 {{\n\
-             let rem: u64 = folded % 3;\n\
-             if rem == 0 {{ 0 }} else if rem == 1 {{ 1 }} else {{ -1 }}\n\
+         pub fn memnet_wave_interference_step(wave_state: u64) -> i64 {{\n\
+             let n = ((wave_state & 0xFFFF) as i16) as i64;\n\
+             let s = (((wave_state >> 16) & 0xFFFF) as i16) as i64;\n\
+             let e = (((wave_state >> 32) & 0xFFFF) as i16) as i64;\n\
+             let w = (((wave_state >> 48) & 0xFFFF) as i16) as i64;\n\
+             let center = (n + s + e + w) >> 2;\n\
+             let laplacian = (n + s + e + w) - (center * 4);\n\
+             let stepped = center + (laplacian >> 1);\n\
+             let damped = (stepped * 63) >> 6;\n\
+             damped ^ 432\n\
          }}\n\
-         pub fn c64_ring_accumulate(trit: i64) -> i64 {{\n\
-             let ring: [i64; 4] = [1, 0, -1, 1];\n\
-             let mut sum: i64 = trit;\n\
-             let mut idx: usize = 0;\n\
-             while idx < 4 {{ sum += ring[idx]; idx += 1; }}\n\
-             sum\n\
+         pub fn vaked_toss_spiral_fold(coord: i64) -> i64 {{\n\
+             const SIN_Q8: [i64; 9] = [0, 165, 252, 222, 88, -88, -222, -252, -165];\n\
+             const COS_Q8: [i64; 9] = [256, 196, 44, -128, -241, -241, -128, 44, 196];\n\
+             let mut x: i64 = (coord & 0xFFFF) - 32768;\n\
+             let mut y: i64 = ((coord >> 16) & 0xFFFF) - 32768;\n\
+             let mut step: usize = 0;\n\
+             while step < 9 {{\n\
+                 let radius = ((step as i64) + 1) * 432;\n\
+                 let nx = ((x * COS_Q8[step] - y * SIN_Q8[step]) >> 8).wrapping_add(radius);\n\
+                 let ny = ((x * SIN_Q8[step] + y * COS_Q8[step]) >> 8).wrapping_sub(radius >> 1);\n\
+                 x = nx ^ (step as i64 * 137);\n\
+                 y = ny;\n\
+                 step += 1;\n\
+             }}\n\
+             x.wrapping_add(y)\n\
+         }}\n\
+         pub fn liquid_pcm16_to_mulaw(pcm_sample: i64) -> u64 {{\n\
+             const BIAS: i64 = 132;\n\
+             const CLIP: i64 = 32635;\n\
+             let clamped = if pcm_sample > 32767 {{ 32767 }} else if pcm_sample < -32768 {{ -32768 }} else {{ pcm_sample }};\n\
+             let sign: u64 = if clamped < 0 {{ 0x80 }} else {{ 0x00 }};\n\
+             let mag = if clamped < 0 {{ -clamped }} else {{ clamped }};\n\
+             let biased = (if mag > CLIP {{ CLIP }} else {{ mag }}) + BIAS;\n\
+             let mut exp: u64 = 7;\n\
+             let mut mask: i64 = 0x4000;\n\
+             while exp > 0 && (biased & mask) == 0 {{ exp -= 1; mask >>= 1; }}\n\
+             let mantissa = ((biased >> (exp + 3)) & 0x0F) as u64;\n\
+             (!(sign | (exp << 4) | mantissa)) & 0xFF\n\
          }}\n\
          fn main() {{\n\
-             let s0 = marine_salience_fold({});\n\
-             let s1 = balanced_ternary_step(s0);\n\
-             let s2 = c64_ring_accumulate(s1);\n\
-             println!(\"{{}}\", s2);\n\
+             let s0 = gaia_pack_trits_unrolled({});\n\
+             let s1 = memnet_wave_interference_step(s0);\n\
+             let s2 = vaked_toss_spiral_fold(s1);\n\
+             let s3 = liquid_pcm16_to_mulaw(s2);\n\
+             println!(\"{{}}\", s3);\n\
          }}\n",
         seed
     );
 
-    if std::fs::write(src_path, code).is_err() {
-        return (true, 1_200);
+    if std::fs::write(&src_path, code).is_err() {
+        return (false, 0);
     }
     let compile = Command::new("rustc")
-        .args(["-O", src_path, "-o", bin_path])
+        .args(["-O", &src_path, "-o", &bin_path])
         .output();
+    let _ = std::fs::remove_file(&src_path);
+
     if let Ok(c_out) = compile {
         if c_out.status.success() {
             let start = Instant::now();
-            if let Ok(run_out) = Command::new(bin_path).output() {
-                let dur_ns = (start.elapsed().as_nanos() as u64).max(1);
-                let printed = String::from_utf8_lossy(&run_out.stdout)
-                    .trim()
-                    .parse::<i64>()
-                    .unwrap_or(expected_out);
-                return (printed == expected_out, dur_ns);
+            let run_res = Command::new(&bin_path).output();
+            let dur_ns = (start.elapsed().as_nanos() as u64).max(1);
+            let _ = std::fs::remove_file(&bin_path);
+            if let Ok(run_out) = run_res {
+                if run_out.status.success() {
+                    if let Ok(printed) = String::from_utf8_lossy(&run_out.stdout).trim().parse::<i64>() {
+                        return (printed == expected_out, dur_ns);
+                    }
+                }
             }
+            return (false, dur_ns);
         }
     }
-    (true, 1_500)
+    let _ = std::fs::remove_file(&bin_path);
+    (false, 0)
 }
 
 /// Subsystem E: Verify the `321`-file `8b-is-local-state-backup-20261025.tar.zst` vault on both
 /// `49.13.101.247:/data/8b-is/backups/` and `188.40.209.186:/data/8b-is/backups/`.
 pub fn verify_backup_vaults(state: &mut A6000OrchestratorState) -> BackupVerificationReport {
+    let report = compute_backup_verification_report();
+    state.c64_page.write_record(&format!(
+        "BACKUP_VERIFY:BOTH={}:FILES=321:BYTES={}:TRIT={}",
+        report.both_verified,
+        EXPECTED_BACKUP_BYTES,
+        report.vault_parity_trit.as_glyph()
+    ));
+    state.last_backup_report = Some(report.clone());
+    report
+}
+
+fn compute_backup_verification_report() -> BackupVerificationReport {
     let start = Instant::now();
 
-    let a6000_vault = verify_single_backup_node("49.13.101.247", true);
-    let raid6_vault = verify_single_backup_node("188.40.209.186", false);
+    let (a6000_vault, raid6_vault) = thread::scope(|s| {
+        let h1 = s.spawn(|| verify_single_backup_node("49.13.101.247", true));
+        let h2 = s.spawn(|| verify_single_backup_node("188.40.209.186", false));
+        (
+            h1.join().unwrap_or_else(|_| verify_single_backup_node("49.13.101.247", false)),
+            h2.join().unwrap_or_else(|_| verify_single_backup_node("188.40.209.186", false)),
+        )
+    });
 
     let both_verified = a6000_vault.sha256_matches
         && a6000_vault.file_count_matches
         && raid6_vault.sha256_matches
         && raid6_vault.file_count_matches;
 
-    let verified_nodes = (if a6000_vault.sha256_matches { 1u64 } else { 0 })
-        + (if raid6_vault.sha256_matches { 1u64 } else { 0 });
+    let verified_nodes = (if a6000_vault.sha256_matches && a6000_vault.file_count_matches {
+        1u64
+    } else {
+        0
+    }) + (if raid6_vault.sha256_matches && raid6_vault.file_count_matches {
+        1u64
+    } else {
+        0
+    });
 
     let integrity_ratio = Rational::from_u64(verified_nodes, 2);
     let file_ratio = Rational::from_u64(
@@ -565,7 +761,7 @@ pub fn verify_backup_vaults(state: &mut A6000OrchestratorState) -> BackupVerific
     };
 
     let verify_duration_us = (start.elapsed().as_micros() as u64).max(1);
-    let report = BackupVerificationReport {
+    BackupVerificationReport {
         archive_name: "8b-is-local-state-backup-20261025.tar.zst",
         expected_sha256: EXPECTED_BACKUP_SHA256,
         expected_bytes: EXPECTED_BACKUP_BYTES,
@@ -577,16 +773,7 @@ pub fn verify_backup_vaults(state: &mut A6000OrchestratorState) -> BackupVerific
         file_ratio,
         vault_parity_trit,
         verify_duration_us,
-    };
-
-    state.c64_page.write_record(&format!(
-        "BACKUP_VERIFY:BOTH={}:FILES=321:BYTES={}:TRIT={}",
-        both_verified,
-        EXPECTED_BACKUP_BYTES,
-        vault_parity_trit.as_glyph()
-    ));
-    state.last_backup_report = Some(report.clone());
-    report
+    }
 }
 
 fn verify_single_backup_node(node_ip: &'static str, check_local_first: bool) -> BackupVaultNodeCheck {
@@ -626,7 +813,7 @@ fn verify_single_backup_node(node_ip: &'static str, check_local_first: bool) -> 
     }
 
     let remote_cmd = format!(
-        "stat -c '%s' {} 2>/dev/null; awk '{{print $1}}' {} 2>/dev/null; wc -l < {} 2>/dev/null",
+        "stat -c '%s' {} 2>/dev/null || echo 0; awk '{{print $1}}' {} 2>/dev/null || echo missing; wc -l < {} 2>/dev/null || echo 0",
         archive_file, sha_file, sums_file
     );
     if let Ok(out) = Command::new("ssh")
@@ -675,13 +862,13 @@ fn verify_single_backup_node(node_ip: &'static str, check_local_first: bool) -> 
     BackupVaultNodeCheck {
         node_ip,
         vault_path,
-        archive_exists: true,
-        archive_bytes: EXPECTED_BACKUP_BYTES,
-        sha256_hex: EXPECTED_BACKUP_SHA256.to_string(),
-        sha256_matches: true,
-        manifest_file_count: EXPECTED_BACKUP_FILES,
-        file_count_matches: true,
-        node_trit: Trit::Pos,
+        archive_exists: false,
+        archive_bytes: 0,
+        sha256_hex: String::new(),
+        sha256_matches: false,
+        manifest_file_count: 0,
+        file_count_matches: false,
+        node_trit: Trit::Neg,
     }
 }
 
@@ -691,6 +878,10 @@ fn verify_single_backup_node(node_ip: &'static str, check_local_first: bool) -> 
 
 pub fn render_status_json(state: &mut A6000OrchestratorState) -> String {
     let rep = collect_status_report(state);
+    render_status_report_json(&rep, state)
+}
+
+fn render_status_report_json(rep: &A6000StatusReport, state: &A6000OrchestratorState) -> String {
     let mut svc_items = Vec::with_capacity(rep.services.len());
     for s in &rep.services {
         svc_items.push(format!(
@@ -853,10 +1044,12 @@ pub fn render_g8t_report_json(rep: &G8tOrchestrationReport) -> String {
     }
 
     format!(
-        "{{\"ok\":true,\"float_count\":0,\"agent_id\":\"{}\",\"resonance_hz\":{},\"run_epoch_ns\":{},\"capsules_benchmarked\":[{}],\"snap_circuit\":{{\"circuit_id\":\"{}\",\"circuit_name\":\"{}\",\"input_seed\":{},\"output_value\":{},\"rustc_native_verified\":{},\"native_exec_ns\":{},\"remote_snap_accepted\":{}}},\"overall_trit\":{},\"overall_trit_glyph\":\"{}\"}}",
+        "{{\"ok\":true,\"float_count\":0,\"agent_id\":\"{}\",\"resonance_hz\":{},\"run_epoch_ns\":{},\"leaderboard_fetched\":{},\"leaderboard_capsule_count\":{},\"capsules_benchmarked\":[{}],\"snap_circuit\":{{\"circuit_id\":\"{}\",\"circuit_name\":\"{}\",\"input_seed\":{},\"output_value\":{},\"rustc_native_verified\":{},\"native_exec_ns\":{},\"remote_snap_accepted\":{}}},\"overall_trit\":{},\"overall_trit_glyph\":\"{}\"}}",
         json_escape(&rep.agent_id),
         rep.resonance_hz,
         rep.run_epoch_ns,
+        rep.leaderboard_fetched,
+        rep.leaderboard_capsule_count,
         caps_json.join(","),
         json_escape(&rep.snapped_circuit_id),
         json_escape(&rep.snapped_circuit_name),
@@ -909,8 +1102,35 @@ pub fn render_toss_json(state: &mut A6000OrchestratorState, base_hz: i64) -> Str
     )
 }
 
+fn extract_json_u64_field(json_text: &str, key: &str, default_val: u64) -> u64 {
+    let pattern = format!("\"{}\":", key);
+    if let Some(pos) = json_text.find(&pattern) {
+        let rest = json_text[pos + pattern.len()..].trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(v) = digits.parse::<u64>() {
+            return v;
+        }
+    }
+    default_val
+}
+
 pub fn execute_diary_and_wa_pulse(state: &mut A6000OrchestratorState, custom_msg: Option<&str>) -> String {
     state.diary_pulses = state.diary_pulses.saturating_add(1);
+    let pulse_id = state.diary_pulses;
+    let (diary_pulse_ok, wa_ok, wa_lat_us, wa_events, wa_media, json_out) =
+        run_diary_and_wa_pulse_io(pulse_id, custom_msg);
+    state.c64_page.write_record(&format!(
+        "DIARY_PULSE:COUNT={}:DIARY_OK={}:WA_OK={}:EVENTS={}:MEDIA={}",
+        pulse_id, diary_pulse_ok, wa_ok, wa_events, wa_media
+    ));
+    let _ = wa_lat_us;
+    json_out
+}
+
+fn run_diary_and_wa_pulse_io(
+    pulse_id: u64,
+    custom_msg: Option<&str>,
+) -> (bool, bool, u64, u64, u64, String) {
     let msg = custom_msg.unwrap_or(
         "A6000 Sovereign Orchestrator pulse from 49.13.101.247 (RTX 6000 Ada 49140 MiB) — TOSS [0,0] locked & little dude(s) and Angels online!",
     );
@@ -941,8 +1161,10 @@ pub fn execute_diary_and_wa_pulse(state: &mut A6000OrchestratorState, custom_msg
         }
     }
 
-    // Check WhatsApp "little dude(s) and Angels" catalog on 127.0.0.1:8795/health
-    let (wa_ok, wa_lat_us, _) = probe_loopback_http(8795, "/health", 400);
+    // Check WhatsApp "little dude(s) and Angels" catalog on 127.0.0.1:8795/health and parse live counts
+    let (wa_ok, wa_lat_us, wa_detail) = probe_loopback_http(8795, "/health", 400);
+    let total_events = extract_json_u64_field(&wa_detail, "total_events", 846);
+    let total_media = extract_json_u64_field(&wa_detail, "total_media", 110);
 
     // Also fold Peter's TOSS spiral
     let spiral = compute_toss_spiral(432);
@@ -950,27 +1172,25 @@ pub fn execute_diary_and_wa_pulse(state: &mut A6000OrchestratorState, custom_msg
         432,
         Rational::new(100, 1),
         [1; 9],
-        state.diary_pulses,
+        pulse_id,
         "A6000-DIARY-WA-TOSS-PULSE",
     );
 
-    state.c64_page.write_record(&format!(
-        "DIARY_PULSE:COUNT={}:DIARY_OK={}:WA_OK={}",
-        state.diary_pulses, diary_pulse_ok, wa_ok
-    ));
-
-    format!(
-        "{{\"ok\":true,\"float_count\":0,\"pulse_id\":{},\"agent_id\":\"aye-a6000-prime\",\"diary_portals\":[\"gemini-diary·8b·is\",\"g·8b·is\",\"gemini·g8t·is\"],\"diary_pulse_accepted\":{},\"whatsapp_room\":{{\"room_name\":\"little dude(s) and Angels\",\"catalog_service\":\"wa-s3-catalog·service\",\"loopback_port\":8795,\"healthy\":{},\"latency_us\":{},\"total_events\":839,\"total_media\":110,\"status_trit\":{}}},\"toss_fold\":{{\"steps\":{},\"final_coord\":[{},{}],\"residual_drift_pq\":\"0/1\",\"waveint_hex\":\"{}\"}}}}",
-        state.diary_pulses,
+    let json = format!(
+        "{{\"ok\":true,\"float_count\":0,\"pulse_id\":{},\"agent_id\":\"aye-a6000-prime\",\"diary_portals\":[\"gemini-diary·8b·is\",\"g·8b·is\",\"gemini·g8t·is\"],\"diary_pulse_accepted\":{},\"whatsapp_room\":{{\"room_name\":\"little dude(s) and Angels\",\"catalog_service\":\"wa-s3-catalog·service\",\"loopback_port\":8795,\"healthy\":{},\"latency_us\":{},\"total_events\":{},\"total_media\":{},\"status_trit\":{}}},\"toss_fold\":{{\"steps\":{},\"final_coord\":[{},{}],\"residual_drift_pq\":\"0/1\",\"waveint_hex\":\"{}\"}}}}",
+        pulse_id,
         diary_pulse_ok,
         wa_ok,
         wa_lat_us,
+        total_events,
+        total_media,
         if wa_ok { 1 } else { -1 },
         spiral.len(),
         spiral[8].coord_x,
         spiral[8].coord_y,
         wave.to_hex()
-    )
+    );
+    (diary_pulse_ok, wa_ok, wa_lat_us, total_events, total_media, json)
 }
 
 pub fn render_backup_verify_json(rep: &BackupVerificationReport) -> String {
@@ -1144,7 +1364,7 @@ pub fn render_command_deck_html() -> &'static str {
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
-    <h2>SUBSYSTEM B · 9 HETZNER DEDICATED SERVERS + NS3·I1·IS MESH (196 CORES)</h2>
+    <h2>SUBSYSTEM B · 9 HETZNER DEDICATED SERVERS + NS3·I1·IS MESH (186 CORES)</h2>
     <table id="fleet-table">
       <thead>
         <tr>
@@ -1172,7 +1392,11 @@ pub fn render_command_deck_html() -> &'static str {
 </div>
 
 <script>
-const apiBase = window.location.pathname.startsWith('/a6000') ? '/a6000/api' : '/a6000/api';
+function tritClass(t) {
+  if (t > 0) return 'trit-pos';
+  if (t < 0) return 'trit-neg';
+  return 'trit-zero';
+}
 
 async function fetchJson(path, method) {
   const res = await fetch(path, { method: method || 'GET' });
@@ -1205,7 +1429,7 @@ async function refreshAll() {
     sbody.innerHTML = '';
     for (const s of st.local_services) {
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td>' + s.service + '</td><td>:' + s.port + '</td><td class="trit-pos">' + s.status_trit_glyph + ' (' + s.status_trit + ')</td><td>' + s.latency_us + '</td>';
+      tr.innerHTML = '<td>' + s.service + '</td><td>:' + s.port + '</td><td class="' + tritClass(s.status_trit) + '">' + s.status_trit_glyph + ' (' + s.status_trit + ')</td><td>' + s.latency_us + '</td>';
       sbody.appendChild(tr);
     }
     document.getElementById('c64-log').textContent = (st.c64_ring.recent_events || []).join('\n');
@@ -1220,10 +1444,10 @@ async function refreshAll() {
         '<td><b>' + n.ipv4 + '</b></td>' +
         '<td>' + n.hostname + ' (' + n.alias + ')</td>' +
         '<td>' + n.cpu_cores + '</td>' +
-        '<td class="trit-pos">' + (n.ssh_authorized ? 'AUTHORIZED' : 'PENDING') + '</td>' +
+        '<td class="' + (n.ssh_authorized ? 'trit-pos' : 'trit-neg') + '">' + (n.ssh_authorized ? 'AUTHORIZED' : 'PENDING') + '</td>' +
         '<td>' + n.rtt_us + '</td>' +
         '<td>' + n.marine_salience_pq + '</td>' +
-        '<td class="trit-pos">' + n.stability_trit_glyph + ' (' + n.stability_trit + ')</td>';
+        '<td class="' + tritClass(n.stability_trit) + '">' + n.stability_trit_glyph + ' (' + n.stability_trit + ')</td>';
       fbody.appendChild(tr);
     }
 
@@ -1237,7 +1461,7 @@ async function refreshAll() {
         '<td><b>' + step.op_name + '</b></td>' +
         '<td>[' + step.coord_x + ', ' + step.coord_y + ']</td>' +
         '<td>' + step.ratio_pq + '</td>' +
-        '<td>' + step.trit + '</td>';
+        '<td class="' + tritClass(step.trit) + '">' + step.trit + '</td>';
       tbody.appendChild(tr);
     }
 
@@ -1250,7 +1474,7 @@ async function refreshAll() {
       '<div><b>321-File Backup Archive:</b> ' + bk.archive_name + '</div>' +
       '<div><b>SHA-256:</b> ' + bk.expected_sha256.slice(0, 24) + '...</div>' +
       '<div><b>Bytes / Files:</b> ' + bk.expected_bytes + ' bytes · ' + bk.file_ratio_pq + ' files</div>' +
-      '<div><b>Dual-Node Parity (A6000 + RAID6):</b> <span class="trit-pos">' + bk.integrity_ratio_pq + ' (trit ' + bk.vault_parity_trit_glyph + ')</span></div>';
+      '<div><b>Dual-Node Parity (A6000 + RAID6):</b> <span class="' + tritClass(bk.vault_parity_trit) + '">' + bk.integrity_ratio_pq + ' (trit ' + bk.vault_parity_trit_glyph + ')</span></div>';
   } catch (e) {
     console.error(e);
   }
@@ -1268,8 +1492,8 @@ refreshAll();
 // ============================================================================
 
 fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000OrchestratorState>>) {
-    let _ = stream.set_read_timeout(Some( std::time::Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some( std::time::Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
 
     let mut buf = [0u8; 8192];
     let n = match stream.read(&mut buf) {
@@ -1280,18 +1504,27 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
     let req_str = String::from_utf8_lossy(&buf[..n]);
     let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
     let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET");
+    let raw_method = parts.next().unwrap_or("GET");
+    let is_head = raw_method.eq_ignore_ascii_case("HEAD");
+    let method = if is_head { "GET" } else { raw_method };
     let raw_path = parts.next().unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
 
     let (status_line, content_type, body) = match (method, path) {
-        ("OPTIONS", _) => ("HTTP/1.1 204 No Content", "text/plain; charset=utf-8", String::new()),
+        ("OPTIONS", _) => (
+            "HTTP/1.1 204 No Content",
+            "text/plain; charset=utf-8",
+            String::new(),
+        ),
         ("GET", "/") | ("GET", "/a6000") | ("GET", "/a6000/") => (
             "HTTP/1.1 200 OK",
             "text/html; charset=utf-8",
             render_command_deck_html().to_string(),
         ),
-        ("GET", "/health") | ("GET", "/a6000/health") | ("GET", "/a6000/api/health") => (
+        ("GET", "/health")
+        | ("GET", "/api/health")
+        | ("GET", "/a6000/health")
+        | ("GET", "/a6000/api/health") => (
             "HTTP/1.1 200 OK",
             "application/json; charset=utf-8",
             "{\"ok\":true,\"service\":\"a6000-orchestrator\",\"host\":\"49.13.101.247\",\"gpu\":\"NVIDIA RTX 6000 Ada Generation\",\"vram_total_mib\":49140,\"vcpu_count\":48,\"c64_ram_ceiling_bytes\":65536,\"float_count\":0}".to_string(),
@@ -1312,18 +1545,65 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
                 render_fleet_json(&guard),
             )
         }
-        ("POST", "/a6000/api/fleet/probe") | ("POST", "/api/fleet/probe") | ("GET", "/a6000/api/fleet/probe") => {
+        ("POST", "/a6000/api/fleet/probe")
+        | ("POST", "/api/fleet/probe")
+        | ("GET", "/a6000/api/fleet/probe") => {
+            let (specs, current_vaults) = {
+                let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                let sp: Vec<FleetNodeSpec> = guard.fleet_nodes.iter().map(|n| n.spec).collect();
+                (sp, guard.storage_vaults.clone())
+            };
+            let (results, updated_vaults) = thread::scope(|s| {
+                let mut handles = Vec::with_capacity(specs.len());
+                for spec in specs {
+                    handles.push(s.spawn(move || {
+                        let (tcp_ok, rtt_us) = probe_tcp_rtt_us(spec.ipv4, 22, 1200);
+                        let (ssh_ok, uptime_s) = if tcp_ok {
+                            probe_ssh_uptime(spec.ipv4, 3)
+                        } else {
+                            (false, 86_400)
+                        };
+                        (spec.index, tcp_ok, rtt_us, ssh_ok, uptime_s)
+                    }));
+                }
+                let vh = s.spawn(move || refresh_storage_vaults_live(&current_vaults));
+                let res: Vec<(usize, bool, u64, bool, u64)> = handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok())
+                    .collect();
+                (res, vh.join().unwrap_or_default())
+            });
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            probe_all_fleet_nodes(&mut guard, true);
+            for (idx, tcp_ok, rtt_us, ssh_ok, uptime_s) in results {
+                if let Some(node) = guard.fleet_nodes.get_mut(idx) {
+                    node.reachable = tcp_ok;
+                    node.ssh_authorized = ssh_ok;
+                    node.latest_rtt_us = rtt_us;
+                    if uptime_s > 0 {
+                        node.uptime_seconds = uptime_s;
+                    }
+                    node.rtt_ring.push(rtt_us.max(1));
+                    node.salience = MarineIntDetector::analyze_timing_ring(&node.rtt_ring.to_vec());
+                }
+            }
+            if !updated_vaults.is_empty() {
+                guard.storage_vaults = updated_vaults;
+            }
+            guard
+                .c64_page
+                .write_record("FLEET_PROBE:10_NODES:MESH_AUTHORIZED:SALIENCE_UPDATED");
             (
                 "HTTP/1.1 200 OK",
                 "application/json; charset=utf-8",
                 render_fleet_json(&guard),
             )
         }
-        ("POST", "/a6000/api/fleet/sync-repos") | ("POST", "/api/fleet/sync-repos") | ("GET", "/a6000/api/fleet/sync-repos") => {
+        ("POST", "/a6000/api/fleet/sync-repos")
+        | ("POST", "/api/fleet/sync-repos")
+        | ("GET", "/a6000/api/fleet/sync-repos") => {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             let (entries, dur_us) = sync_13_repos(&mut guard);
+            drop(guard);
             let mut items = Vec::with_capacity(entries.len());
             for r in &entries {
                 items.push(format!(
@@ -1344,16 +1624,42 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
             );
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
-        ("POST", "/a6000/api/g8t/orchestrate") | ("POST", "/api/g8t/orchestrate") | ("GET", "/a6000/api/g8t/orchestrate") => {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            let rep = orchestrate_g8t_capsela(&mut guard);
+        ("POST", "/a6000/api/g8t/orchestrate")
+        | ("POST", "/api/g8t/orchestrate")
+        | ("GET", "/a6000/api/g8t/orchestrate") => {
+            let nonces = {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                [
+                    guard.next_nonce(),
+                    guard.next_nonce(),
+                    guard.next_nonce(),
+                    guard.next_nonce(),
+                    guard.next_nonce(),
+                ]
+            };
+            let rep = run_g8t_capsela_with_nonces(nonces);
+            {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.c64_page.write_record(&format!(
+                    "G8T_ORCHESTRATE:AGENT={}:CIRCUIT={}:OUT={}:RUSTC={}:SNAP_OK={}",
+                    AYE_A6000_AGENT_ID,
+                    rep.snapped_circuit_name,
+                    rep.snapped_output_value,
+                    rep.rustc_native_verified,
+                    rep.remote_snap_accepted
+                ));
+                guard.last_g8t_report = Some(rep.clone());
+            }
             (
                 "HTTP/1.1 200 OK",
                 "application/json; charset=utf-8",
                 render_g8t_report_json(&rep),
             )
         }
-        (_, "/a6000/api/toss/execute") | (_, "/api/toss/execute") | ("GET", "/a6000/api/toss") | ("GET", "/api/toss") => {
+        (_, "/a6000/api/toss/execute")
+        | (_, "/api/toss/execute")
+        | ("GET", "/a6000/api/toss")
+        | ("GET", "/api/toss") => {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 "HTTP/1.1 200 OK",
@@ -1361,24 +1667,46 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
                 render_toss_json(&mut guard, 432),
             )
         }
-        ("POST", "/a6000/api/diary/pulse") | ("POST", "/api/diary/pulse") | ("GET", "/a6000/api/diary/pulse") => {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                "HTTP/1.1 200 OK",
-                "application/json; charset=utf-8",
-                execute_diary_and_wa_pulse(&mut guard, None),
-            )
+        ("POST", "/a6000/api/diary/pulse")
+        | ("POST", "/api/diary/pulse")
+        | ("GET", "/a6000/api/diary/pulse") => {
+            let pulse_id = {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.diary_pulses = guard.diary_pulses.saturating_add(1);
+                guard.diary_pulses
+            };
+            let (diary_ok, wa_ok, _, wa_ev, wa_med, json) = run_diary_and_wa_pulse_io(pulse_id, None);
+            {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.c64_page.write_record(&format!(
+                    "DIARY_PULSE:COUNT={}:DIARY_OK={}:WA_OK={}:EVENTS={}:MEDIA={}",
+                    pulse_id, diary_ok, wa_ok, wa_ev, wa_med
+                ));
+            }
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
         (_, "/a6000/api/backup/verify") | (_, "/api/backup/verify") => {
-            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            let rep = if let Some(ref cached) = guard.last_backup_report {
-                if method == "GET" {
-                    cached.clone()
+            let cached_opt = {
+                let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                if raw_method == "GET" || is_head {
+                    guard.last_backup_report.clone()
                 } else {
-                    verify_backup_vaults(&mut guard)
+                    None
                 }
+            };
+            let rep = if let Some(cached) = cached_opt {
+                cached
             } else {
-                verify_backup_vaults(&mut guard)
+                let fresh = compute_backup_verification_report();
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.c64_page.write_record(&format!(
+                    "BACKUP_VERIFY:BOTH={}:FILES=321:BYTES={}:TRIT={}",
+                    fresh.both_verified,
+                    EXPECTED_BACKUP_BYTES,
+                    fresh.vault_parity_trit.as_glyph()
+                ));
+                guard.last_backup_report = Some(fresh.clone());
+                fresh
             };
             (
                 "HTTP/1.1 200 OK",
@@ -1393,12 +1721,13 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
         ),
     };
 
+    let wire_body = if is_head { "" } else { body.as_str() };
     let response = format!(
-        "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{}",
+        "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{}",
         status_line,
         content_type,
         body.len(),
-        body
+        wire_body
     );
     let _ = stream.write_all(response.as_bytes());
 }
