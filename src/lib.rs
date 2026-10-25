@@ -686,9 +686,9 @@ impl MarineIntDetector {
         let mut sum_period_jitter = Rational::ZERO;
         let mut trip_count = 0u64;
         for win in samples.windows(3) {
-            let d1 = win[1].abs_diff(win[0]).max(1);
-            let d2 = win[2].abs_diff(win[1]).max(1);
-            let max_d = d1.max(d2);
+            let d1 = win[1].abs_diff(win[0]);
+            let d2 = win[2].abs_diff(win[1]);
+            let max_d = win[0].max(win[1]).max(win[2]).max(1);
             let diff = d1.abs_diff(d2);
             sum_period_jitter = sum_period_jitter.add(Rational::from_u64(diff, max_d));
             trip_count += 1;
