@@ -1,0 +1,24 @@
+[package]
+name = "a6000-orchestrator"
+version = "1.0.0"
+edition = "2021"
+authors = [
+    "Hue (Christopher Chenoweth) <c@8b.is>",
+    "Aye & Gemini <g@8b.is>",
+    "Alexandra Chenoweth <a@8b.is>",
+    "Peter Lodri (Omni) <p@8b.is>",
+]
+description = "100% Pure-Rust A6000 Sovereign Constellation Orchestrator (cheet.is · 49.13.101.247 · RTX 6000 Ada) — C64 64KB Ring Buffers, MarineIntDetector Salience, Strict 8b.is No-Float Law, 9-Server Hetzner Fleet + ns3.i1.is Mesh, g8t.is Aye-Only Capsela & Snap-Circuit Composer, Peter's TOSS Spiral & 321-File Backup Vault"
+license = "MIT"
+default-run = "a6000-orchestrator"
+
+[[bin]]
+name = "a6000-orchestrator"
+path = "src/main.rs"
+
+[[bin]]
+name = "a6000-ctl"
+path = "src/bin/a6000-ctl.rs"
+
+[dependencies]
+# Zero external dependencies! 100% Pure-Rust stdlib + Commodore-64 64KB Ring Buffer substrate.
