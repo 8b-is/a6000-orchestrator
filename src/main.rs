@@ -31,21 +31,13 @@ impl A6000OrchestratorState {
 
         let mut fleet_nodes = Vec::with_capacity(FLEET_NODES.len());
         for spec in FLEET_NODES {
-            let mut rtt_ring = RingBuffer::<u64, 64>::new();
-            let seed_us = if spec.ipv4 == "49.13.101.247" {
-                45
-            } else if spec.is_hetzner_dedicated {
-                420
-            } else {
-                142_000
-            };
-            rtt_ring.push(seed_us);
-            let salience = MarineIntDetector::analyze_timing_ring(&rtt_ring.to_vec());
+            let rtt_ring = RingBuffer::<u64, 64>::new();
+            let salience = MarineIntDetector::analyze_timing_ring(&[]);
             fleet_nodes.push(FleetNodeStatus {
                 spec,
                 reachable: true,
                 ssh_authorized: true,
-                latest_rtt_us: seed_us,
+                latest_rtt_us: 0,
                 uptime_seconds: 86_400,
                 rtt_ring,
                 salience,
