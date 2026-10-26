@@ -22,6 +22,11 @@ pub struct A6000OrchestratorState {
     pub last_backup_report: Option<BackupVerificationReport>,
     pub toss_executions: u64,
     pub diary_pulses: u64,
+    pub improver_ring: RingBuffer<CodeImprovementRecord, 64>,
+    pub improver_cycle_counter: u64,
+    pub borg_ring: RingBuffer<BorgAssimilatedCapsule, 64>,
+    pub borg_assimilation_counter: u64,
+    pub last_borg_sync_report: Option<BorgSyncReport>,
 }
 
 impl A6000OrchestratorState {
@@ -91,6 +96,9 @@ impl A6000OrchestratorState {
             })
             .collect();
 
+        let (improver_ring, improver_cycle_counter) = load_persisted_improver_records();
+        let (borg_ring, borg_assimilation_counter) = load_persisted_borg_capsules();
+
         let mut state = Self {
             c64_page,
             gpu_ring: RingBuffer::new(),
@@ -103,6 +111,11 @@ impl A6000OrchestratorState {
             last_backup_report: None,
             toss_executions: 1,
             diary_pulses: 1,
+            improver_ring,
+            improver_cycle_counter,
+            borg_ring,
+            borg_assimilation_counter,
+            last_borg_sync_report: None,
         };
 
         let (_, sample) = query_nvidia_smi_tick(1);
@@ -901,9 +914,16 @@ fn render_status_report_json(rep: &A6000StatusReport, state: &A6000OrchestratorS
     let c64_ratio = state.c64_page.ram_ratio();
     let logs = state.c64_page.recent_records(8);
     let logs_json: Vec<String> = logs.iter().map(|l| format!("\"{}\"", json_escape(l))).collect();
+    let improver_summary = summarize_improver_ring(
+        &state.improver_ring,
+        state.improver_cycle_counter as usize,
+        rep.vram_used_mib,
+        rep.vram_total_mib,
+    );
+    let vlan_status = query_vlan_160tb_vault_status();
 
     format!(
-        "{{\"ok\":true,\"orchestrator\":\"a6000-orchestrator\",\"sovereign_law\":\"strict-8b-is-no-float\",\"float_count\":0,\"node_ip\":\"{}\",\"hetzner_id\":\"{}\",\"node_hostname\":\"{}\",\"gpu\":{{\"name\":\"{}\",\"vcpu_count\":{},\"vram_used_mib\":{},\"vram_total_mib\":{},\"vram_free_mib\":{},\"vram_ratio_pq\":\"{}\",\"vram_ratio\":{},\"gpu_util_pct\":{},\"gpu_util_pq\":\"{}\",\"gpu_util_ratio\":{},\"temp_celsius\":{},\"power_milliwatts\":{},\"power_watts_pq\":\"{}\",\"load_trit\":{},\"load_trit_glyph\":\"{}\",\"marine_salience_pq\":\"{}\",\"marine_salience\":{}}},\"c64_ring\":{{\"capacity_bytes\":{},\"used_bytes\":{},\"ram_ratio_pq\":\"{}\",\"gpu_tick_ring_len\":{},\"gpu_tick_ring_capacity\":64,\"recent_events\":[{}]}},\"local_services\":[{}],\"healthy_service_ratio_pq\":\"{}\",\"fleet_nodes_count\":{},\"synced_repos_count\":{},\"toss_executions\":{},\"diary_pulses\":{}}}",
+        "{{\"ok\":true,\"orchestrator\":\"a6000-orchestrator\",\"sovereign_law\":\"strict-8b-is-no-float\",\"float_count\":0,\"node_ip\":\"{}\",\"hetzner_id\":\"{}\",\"node_hostname\":\"{}\",\"gpu\":{{\"name\":\"{}\",\"vcpu_count\":{},\"vram_used_mib\":{},\"vram_total_mib\":{},\"vram_free_mib\":{},\"vram_ratio_pq\":\"{}\",\"vram_ratio\":{},\"gpu_util_pct\":{},\"gpu_util_pq\":\"{}\",\"gpu_util_ratio\":{},\"temp_celsius\":{},\"power_milliwatts\":{},\"power_watts_pq\":\"{}\",\"load_trit\":{},\"load_trit_glyph\":\"{}\",\"marine_salience_pq\":\"{}\",\"marine_salience\":{}}},\"c64_ring\":{{\"capacity_bytes\":{},\"used_bytes\":{},\"ram_ratio_pq\":\"{}\",\"gpu_tick_ring_len\":{},\"gpu_tick_ring_capacity\":64,\"recent_events\":[{}]}},\"local_services\":[{}],\"healthy_service_ratio_pq\":\"{}\",\"fleet_nodes_count\":{},\"synced_repos_count\":{},\"toss_executions\":{},\"diary_pulses\":{},\"subsystem_f_improver\":{},\"subsystem_g_borg_vlan\":{{\"vlan_160tb\":{},\"borg_assimilated_count\":{}}}}}",
         rep.node_ip,
         rep.hetzner_id,
         json_escape(&rep.node_hostname),
@@ -934,7 +954,10 @@ fn render_status_report_json(rep: &A6000StatusReport, state: &A6000OrchestratorS
         state.fleet_nodes.len(),
         state.synced_repos.len(),
         state.toss_executions,
-        state.diary_pulses
+        state.diary_pulses,
+        improver_summary.to_json(),
+        vlan_status.to_json(),
+        state.borg_ring.len()
     )
 }
 
@@ -1226,6 +1249,75 @@ pub fn render_backup_verify_json(rep: &BackupVerificationReport) -> String {
     )
 }
 
+pub fn render_improve_status_json(state: &A6000OrchestratorState) -> String {
+    let latest_vram = state
+        .gpu_ring
+        .latest()
+        .map(|s| s.vram_used_mib)
+        .unwrap_or(14_440);
+    let summary = summarize_improver_ring(
+        &state.improver_ring,
+        state.improver_cycle_counter as usize,
+        latest_vram,
+        A6000_VRAM_TOTAL_MIB,
+    );
+    let records = state.improver_ring.to_vec();
+    let recs_json: Vec<String> = records.iter().rev().take(16).map(|r| r.to_json()).collect();
+    format!(
+        "{{\"ok\":true,\"float_count\":0,\"subsystem\":\"SUBSYSTEM_F_CONTINUOUS_IMPROVER\",\"summary\":{},\"recent_records\":[{}]}}",
+        summary.to_json(),
+        recs_json.join(",")
+    )
+}
+
+pub fn render_improve_cycle_json(
+    rec: &CodeImprovementRecord,
+    state: &mut A6000OrchestratorState,
+) -> String {
+    let gpu_rep = collect_status_report(state);
+    let summary = summarize_improver_ring(
+        &state.improver_ring,
+        state.improver_cycle_counter as usize,
+        gpu_rep.vram_used_mib,
+        gpu_rep.vram_total_mib,
+    );
+    let records = state.improver_ring.to_vec();
+    let recs_json: Vec<String> = records.iter().rev().take(16).map(|r| r.to_json()).collect();
+    format!(
+        "{{\"ok\":true,\"float_count\":0,\"subsystem\":\"SUBSYSTEM_F_CONTINUOUS_IMPROVER\",\"cycle_record\":{},\"summary\":{},\"gpu\":{{\"name\":\"{}\",\"vram_used_mib\":{},\"vram_total_mib\":{},\"vram_ratio_pq\":\"{}\",\"gpu_util_pct\":{},\"gpu_util_pq\":\"{}\",\"temp_celsius\":{},\"power_milliwatts\":{},\"power_watts_pq\":\"{}\"}},\"recent_records\":[{}]}}",
+        rec.to_json(),
+        summary.to_json(),
+        json_escape(&gpu_rep.gpu_name),
+        gpu_rep.vram_used_mib,
+        gpu_rep.vram_total_mib,
+        gpu_rep.vram_ratio,
+        gpu_rep.gpu_util_pct,
+        gpu_rep.gpu_util_ratio,
+        gpu_rep.temp_celsius,
+        gpu_rep.power_milliwatts,
+        gpu_rep.power_watts_ratio,
+        recs_json.join(",")
+    )
+}
+
+pub fn render_borg_status_json(state: &A6000OrchestratorState) -> String {
+    let vlan_status = query_vlan_160tb_vault_status();
+    let capsules = state.borg_ring.to_vec();
+    let caps_json: Vec<String> = capsules.iter().rev().take(16).map(|c| c.to_json()).collect();
+    let sync_json = state
+        .last_borg_sync_report
+        .as_ref()
+        .map(|s| s.to_json())
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"ok\":true,\"float_count\":0,\"subsystem\":\"SUBSYSTEM_G_BORG_ASSIMILATOR_VLAN_4010\",\"vlan_160tb_link\":{},\"last_sync_report\":{},\"assimilated_count\":{},\"assimilated_capsules\":[{}]}}",
+        vlan_status.to_json(),
+        sync_json,
+        state.borg_ring.total_writes(),
+        caps_json.join(",")
+    )
+}
+
 // ============================================================================
 // INTERACTIVE DARK-MODE COMMAND DECK HTML (ZERO FLOATS IN HTML/CSS/JS)
 // ============================================================================
@@ -1321,15 +1413,15 @@ pub fn render_command_deck_html() -> &'static str {
     <h1>A6000 SOVEREIGN CONSTELLATION COMMAND DECK</h1>
     <div class="subtitle">
       Node Prime: 49.13.101.247 (cheet·is / a6000·8b·is / g6k2·nue·8s·is · Hetzner #2936091) ·
-      NVIDIA RTX 6000 Ada (49140 MiB VRAM · 48-vCPU Xeon)
+      NVIDIA RTX 6000 Ada (49140 MiB VRAM · 48-vCPU Xeon) · VLAN 4010 (10.101.40.247 &lt;-&gt; 10.101.40.186 160 TB Vault)
     </div>
     <div class="badge-bar">
       <span class="badge badge-green">100% Pure Rust · #![forbid(unsafe_code)]</span>
       <span class="badge badge-green">Strict 8b·is No-Float Law (float_count = 0)</span>
-      <span class="badge">Commodore-64 65536-Byte Ring Buffers</span>
-      <span class="badge">MarineIntDetector Salience (p/q)</span>
-      <span class="badge">aye-a6000-prime @ 432 Hz</span>
-      <span class="badge">321-File Backup Vault Parity (+1)</span>
+      <span class="badge badge-green">RTX 6000 Ada Resident (keep_alive = -1)</span>
+      <span class="badge">Hetzner VLAN 4010 (vSwitch #71596 · 160 TB Link)</span>
+      <span class="badge">Subsystem F Continuous Improver (45s Cadence)</span>
+      <span class="badge">The Borg Polyglot Code Assimilator</span>
     </div>
   </header>
 
@@ -1337,14 +1429,42 @@ pub fn render_command_deck_html() -> &'static str {
     <h2>SOVEREIGN ORCHESTRATION ACTIONS</h2>
     <div class="btn-row">
       <button onclick="refreshAll()">Refresh Telemetry</button>
-      <button class="btn-teal" onclick="runAction('/a6000/api/fleet/probe')">Probe 10-Server Fleet Mesh</button>
-      <button class="btn-teal" onclick="runAction('/a6000/api/fleet/sync-repos')">Sync 13 8b-is GitHub Repos</button>
-      <button class="btn-purple" onclick="runAction('/a6000/api/g8t/orchestrate')">Run g8t·is Capsela Bench + Vote + Snap</button>
-      <button onclick="runAction('/a6000/api/toss/execute')">Execute Peter's 9-Step TOSS Spiral</button>
-      <button onclick="runAction('/a6000/api/diary/pulse')">Pulse gemini-diary·8b·is + WhatsApp Room</button>
-      <button class="btn-teal" onclick="runAction('/a6000/api/backup/verify')">Verify 321-File Backup Vaults</button>
+      <button class="btn-teal" onclick="runAction('/a6000/api/fleet/probe')">[1] Probe 10-Server Fleet Mesh</button>
+      <button class="btn-teal" onclick="runAction('/a6000/api/fleet/sync-repos')">[2] Sync 13 8b-is GitHub Repos</button>
+      <button class="btn-purple" onclick="runAction('/a6000/api/g8t/orchestrate')">[3] Run g8t·is Capsela Bench + Vote + Snap</button>
+      <button onclick="runAction('/a6000/api/toss/execute')">[4] Execute Peter's 9-Step TOSS Spiral</button>
+      <button onclick="runAction('/a6000/api/diary/pulse')">[5] Pulse gemini-diary·8b·is + WhatsApp Room</button>
+      <button class="btn-purple" onclick="runAction('/a6000/api/improve/cycle')">[6] RUN A6000 GPU CODE IMPROVE CYCLE</button>
+      <button class="btn-teal" onclick="runAction('/a6000/api/borg/sync')">[7] BORG ASSIMILATE + SYNC-GITHUB (160 TB VLAN 4010)</button>
+      <button onclick="runAction('/a6000/api/backup/verify')">[8] Verify 321-File Backup Vaults</button>
     </div>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM F · alexiai·service (:8787) × RTX 6000 Ada Continuous Repo &amp; g8t·is Improver</h2>
+    <div id="improver-summary">Loading alexiai·service (:8787) + RTX 6000 Ada Continuous Code Improver status...</div>
+    <table id="improver-table">
+      <thead>
+        <tr>
+          <th>Cycle</th><th>Repo</th><th>Target Symbol / Kind</th><th>rustc Test</th><th>Speedup (p/q)</th><th>GPU Tok/s (p/q)</th><th>BLAKE3 64-Vec</th><th>ALEXIAI:8787 + RTX 6000 Ada Recommendation</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM G · HETZNER VLAN 4010 (160 TB VAULT LINK) + SYNC-GITHUB &amp; THE BORG CODE ASSIMILATOR</h2>
+    <div id="borg-summary">Loading Hetzner VLAN 4010 &amp; Borg Assimilator telemetry...</div>
+    <table id="borg-table">
+      <thead>
+        <tr>
+          <th>#</th><th>Source Repo &amp; Lang</th><th>Foreign Symbol -&gt; Pure-Rust Capsule</th><th>Sig</th><th>ELF .text</th><th>Cycles/Op (p/q)</th><th>BLAKE3 Class</th><th>g8t·is</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div class="grid">
@@ -1434,6 +1554,56 @@ async function refreshAll() {
     }
     document.getElementById('c64-log').textContent = (st.c64_ring.recent_events || []).join('\n');
 
+    const imp = await fetchJson('/a6000/api/improve/status', 'GET');
+    const sm = imp.summary;
+    document.getElementById('improver-summary').innerHTML =
+      '<div><b>Autonomous Loop:</b> ACTIVE (' + sm.interval_secs + 's cadence) · Total Cycles: <b>' + sm.total_cycles + '</b> · Next Repo: <b>' + sm.next_repo_name + '</b></div>' +
+      '<div><b>RTX 6000 Ada Model:</b> ' + sm.active_gpu_model + ' (keep_alive = -1 · Resident VRAM: <b>' + sm.gpu_vram_resident_mib + ' / ' + sm.gpu_vram_total_mib + ' MiB</b> = ' + sm.gpu_vram_ratio_pq + ')</div>' +
+      '<div><b>Verification:</b> Tests Passed = <b>' + sm.tests_passed_ratio_pq + '</b> · Sovereign Clean (unsafe=0, float=0) = <b>' + sm.sovereign_clean_ratio_pq + '</b> · Mean Speedup = <b>' + sm.mean_speedup_pq + '</b></div>';
+
+    const ibody = document.querySelector('#improver-table tbody');
+    ibody.innerHTML = '';
+    for (const r of (imp.recent_records || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>#' + r.cycle_id + '</td>' +
+        '<td><b>' + r.repo_name + '</b><br><small>' + r.git_commit_after + '</small></td>' +
+        '<td><b>' + r.target_symbol + '</b><br><small>' + r.improvement_kind + '</small></td>' +
+        '<td class="' + (r.cargo_test_passed ? 'trit-pos' : 'trit-neg') + '">' + (r.cargo_test_passed ? 'PASS (' + r.test_duration_ms + 'ms)' : 'FAIL') + '</td>' +
+        '<td><b>' + r.speedup_pq + '</b> (' + r.baseline_ns_per_op + '-&gt;' + r.improved_ns_per_op + 'ns)</td>' +
+        '<td>' + r.gpu_tok_per_sec_pq + '</td>' +
+        '<td><code>' + r.blake3_equivalence_hash.slice(0, 12) + '</code></td>' +
+        '<td>' + r.gpu_recommendation + '</td>' +
+        '<td class="' + tritClass(r.verdict_trit) + '">' + r.verdict_trit_glyph + ' (' + r.verdict_trit + ')</td>';
+      ibody.appendChild(tr);
+    }
+
+    const bg = await fetchJson('/a6000/api/borg/status', 'GET');
+    const vl = bg.vlan_160tb_link;
+    document.getElementById('borg-summary').innerHTML =
+      '<div><b>Hetzner vSwitch #' + vl.vswitch_id + ' (' + vl.vswitch_name + ' · VLAN ' + vl.vlan_id + '):</b> ' +
+      vl.a6000_vlan_ip + ' &lt;-&gt; ' + vl.raid160_vlan_ip + ' (RTT = <b>' + vl.vlan_rtt_us + ' us</b> · Trit <span class="' + tritClass(vl.link_trit) + '">' + vl.link_trit_glyph + '</span>)</div>' +
+      '<div><b>160 TB Vault Mounts:</b> <code>' + vl.raid160_mount_path + '</code> (' + vl.raid160_free_gib + ' / ' + vl.raid160_total_gib + ' GiB free RAID6) · ' +
+      '<code>' + vl.git160_mount_path + '</code> (' + vl.git160_free_gib + ' / ' + vl.git160_total_gib + ' GiB free Git Vault)</div>' +
+      '<div><b>Synced GitHub Owners (' + vl.synced_github_owners.join(', ') + '):</b> <b>' + vl.total_synced_github_repos + '</b> repositories on /data/git · Borg-Assimilated Capsules: <b>' + bg.assimilated_count + '</b></div>';
+
+    const bbody = document.querySelector('#borg-table tbody');
+    bbody.innerHTML = '';
+    for (const c of (bg.assimilated_capsules || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>#' + c.assimilation_id + '</td>' +
+        '<td><b>' + c.github_owner + '/' + c.source_repo + '</b><br><small>[' + c.source_language + '] ' + c.source_path + '</small></td>' +
+        '<td><code>' + c.original_symbol + '</code> -&gt; <b><code>' + c.capsule_fn_name + '</code></b><br><small>' + c.gpu_transmutation_note + '</small></td>' +
+        '<td><code>' + c.signature_key + '</code></td>' +
+        '<td>' + c.compiled_text_bytes + ' B</td>' +
+        '<td><b>' + c.cycles_per_op_pq + '</b> (' + c.ns_per_op + 'ns)</td>' +
+        '<td><code>' + c.blake3_equivalence_hash.slice(0, 12) + '</code></td>' +
+        '<td class="' + (c.g8t_published ? 'trit-pos' : 'trit-zero') + '">' + (c.g8t_published ? 'PUBLISHED [+]' : 'LOCAL') + '</td>' +
+        '<td class="' + tritClass(c.verdict_trit) + '">' + c.verdict_trit_glyph + '</td>';
+      bbody.appendChild(tr);
+    }
+
     const fl = await fetchJson('/a6000/api/fleet', 'GET');
     const fbody = document.querySelector('#fleet-table tbody');
     fbody.innerHTML = '';
@@ -1469,7 +1639,7 @@ async function refreshAll() {
     document.getElementById('g8t-summary').innerHTML =
       '<div><b>Aye Identity:</b> aye-a6000-prime (432 Hz · BLAKE3 AyeAttestation)</div>' +
       '<div><b>Synced 8b-is Repos:</b> ' + fl.synced_repos.length + ' / 13 verified on /data/8b-is</div>' +
-      '<div><b>188.40.209.186 Vaults:</b> 102 TiB /data/8b-is RAID6 + 15 TiB /data/git</div>' +
+      '<div><b>188.40.209.186 Vaults:</b> 102 TiB /data/8b-is RAID6 + 15 TiB /data/git (VLAN 4010)</div>' +
       '<hr style="border-color:#1e293b;margin:8px 0;">' +
       '<div><b>321-File Backup Archive:</b> ' + bk.archive_name + '</div>' +
       '<div><b>SHA-256:</b> ' + bk.expected_sha256.slice(0, 24) + '...</div>' +
@@ -1491,9 +1661,22 @@ refreshAll();
 // HTTP SERVER ENGINE (127.0.0.1:8790 / 0.0.0.0:8790)
 // ============================================================================
 
+fn extract_query_param(raw_path: &str, key: &str) -> Option<String> {
+    let query = raw_path.split('?').nth(1)?;
+    let prefix = format!("{}=", key);
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix(&prefix) {
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000OrchestratorState>>) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
     let mut buf = [0u8; 8192];
     let n = match stream.read(&mut buf) {
@@ -1536,6 +1719,85 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
                 "application/json; charset=utf-8",
                 render_status_json(&mut guard),
             )
+        }
+        ("GET", "/a6000/api/improve/status")
+        | ("GET", "/api/improve/status")
+        | ("GET", "/a6000/api/improve")
+        | ("GET", "/api/improve") => {
+            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                "HTTP/1.1 200 OK",
+                "application/json; charset=utf-8",
+                render_improve_status_json(&guard),
+            )
+        }
+        (_, "/a6000/api/improve/cycle") | (_, "/api/improve/cycle") => {
+            let req_repo = extract_query_param(raw_path, "repo");
+            let (cycle_id, nonce) = {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.improver_cycle_counter = guard.improver_cycle_counter.saturating_add(1);
+                let cid = guard.improver_cycle_counter;
+                let n = guard.next_nonce();
+                (cid, n)
+            };
+            let rec = run_code_improvement_cycle_io(cycle_id, req_repo.as_deref(), nonce);
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.improver_ring.push(rec.clone());
+            guard.c64_page.write_record(&format!(
+                "IMPROVE_CYCLE:ID={}:REPO={}:SYM={}:SPEEDUP={}:TEST_OK={}:VRAM={}",
+                rec.cycle_id,
+                rec.repo_name,
+                rec.target_symbol,
+                rec.speedup_pq,
+                rec.cargo_test_passed,
+                rec.gpu_vram_mib
+            ));
+            let json = render_improve_cycle_json(&rec, &mut guard);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        ("GET", "/a6000/api/borg/status")
+        | ("GET", "/api/borg/status")
+        | ("GET", "/a6000/api/borg")
+        | ("GET", "/api/borg") => {
+            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                "HTTP/1.1 200 OK",
+                "application/json; charset=utf-8",
+                render_borg_status_json(&guard),
+            )
+        }
+        (_, "/a6000/api/borg/sync")
+        | (_, "/api/borg/sync")
+        | (_, "/a6000/api/borg/assimilate")
+        | (_, "/api/borg/assimilate") => {
+            let owner = extract_query_param(raw_path, "owner").unwrap_or_else(|| "8b-is".to_string());
+            let mut sync_rep = sync_github_owner_io(&owner, 25);
+            let (id1, n1, id2, n2) = {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.borg_assimilation_counter = guard.borg_assimilation_counter.saturating_add(1);
+                let a1 = guard.borg_assimilation_counter;
+                let nonce1 = guard.next_nonce();
+                guard.borg_assimilation_counter = guard.borg_assimilation_counter.saturating_add(1);
+                let a2 = guard.borg_assimilation_counter;
+                let nonce2 = guard.next_nonce();
+                (a1, nonce1, a2, nonce2)
+            };
+            let cap1 = run_borg_assimilation_cycle_io(id1, n1);
+            let cap2 = run_borg_assimilation_cycle_io(id2, n2);
+            sync_rep.assimilated_count = 2;
+            sync_rep.published_to_g8t_count =
+                (if cap1.g8t_published { 1 } else { 0 }) + (if cap2.g8t_published { 1 } else { 0 });
+
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.borg_ring.push(cap1.clone());
+            guard.borg_ring.push(cap2.clone());
+            guard.last_borg_sync_report = Some(sync_rep);
+            guard.c64_page.write_record(&format!(
+                "BORG_SYNC:OWNER={}:CAPS={},{}:G8T_PUB={}",
+                owner, cap1.capsule_fn_name, cap2.capsule_fn_name, cap1.g8t_published || cap2.g8t_published
+            ));
+            let json = render_borg_status_json(&guard);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
         ("GET", "/a6000/api/fleet") | ("GET", "/api/fleet") => {
             let guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1732,6 +1994,74 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
     let _ = stream.write_all(response.as_bytes());
 }
 
+/// Spawn the continuous autonomous background worker (`Subsystem F` + `Subsystem G`) that
+/// warms the RTX 6000 Ada (`keep_alive: -1`) immediately on startup and continuously audits,
+/// benchmarks, improves, and Borg-assimilates code across the 13 repositories every 45 seconds.
+fn spawn_continuous_improver_thread(shared: Arc<Mutex<A6000OrchestratorState>>) {
+    thread::spawn(move || {
+        let initial_boot_steps: u64 = {
+            let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.improver_ring.len() < 3 {
+                3
+            } else {
+                1
+            }
+        };
+        // Warm up initial Borg polyglot capsules + initial repo improvement cycles on startup
+        for boot_step in 0..initial_boot_steps {
+            let (cid, nonce, bid, bnonce) = {
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                guard.improver_cycle_counter = guard.improver_cycle_counter.saturating_add(1);
+                let c = guard.improver_cycle_counter;
+                let n = guard.next_nonce();
+                guard.borg_assimilation_counter = guard.borg_assimilation_counter.saturating_add(1);
+                let b = guard.borg_assimilation_counter;
+                let bn = guard.next_nonce();
+                (c, n, b, bn)
+            };
+            let rec = run_code_improvement_cycle_io(cid, None, nonce);
+            let bcap = run_borg_assimilation_cycle_io(bid, bnonce);
+            {
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                guard.improver_ring.push(rec.clone());
+                guard.borg_ring.push(bcap.clone());
+                guard.c64_page.write_record(&format!(
+                    "BOOT_IMPROVE:CYCLE={}:REPO={}:SPEEDUP={}:BORG={}",
+                    rec.cycle_id, rec.repo_name, rec.speedup_pq, bcap.capsule_fn_name
+                ));
+            }
+            if boot_step == 0 {
+                let sync_rep = sync_github_owner_io("8b-is", 25);
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                guard.last_borg_sync_report = Some(sync_rep);
+            }
+        }
+
+        loop {
+            thread::sleep(std::time::Duration::from_secs(SUBSYSTEM_F_INTERVAL_SECS));
+            let (cid, nonce, bid, bnonce) = {
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                guard.improver_cycle_counter = guard.improver_cycle_counter.saturating_add(1);
+                let c = guard.improver_cycle_counter;
+                let n = guard.next_nonce();
+                guard.borg_assimilation_counter = guard.borg_assimilation_counter.saturating_add(1);
+                let b = guard.borg_assimilation_counter;
+                let bn = guard.next_nonce();
+                (c, n, b, bn)
+            };
+            let rec = run_code_improvement_cycle_io(cid, None, nonce);
+            let bcap = run_borg_assimilation_cycle_io(bid, bnonce);
+            let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+            guard.improver_ring.push(rec.clone());
+            guard.borg_ring.push(bcap.clone());
+            guard.c64_page.write_record(&format!(
+                "AUTO_IMPROVE:CYCLE={}:REPO={}:SPEEDUP={}:BORG={}",
+                rec.cycle_id, rec.repo_name, rec.speedup_pq, bcap.capsule_fn_name
+            ));
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let subcmd = args.get(1).map(String::as_str).unwrap_or("serve");
@@ -1762,6 +2092,31 @@ fn main() {
             println!("{}", render_backup_verify_json(&rep));
             return;
         }
+        "improve" => {
+            init_state.improver_cycle_counter = init_state.improver_cycle_counter.saturating_add(1);
+            let cid = init_state.improver_cycle_counter;
+            let nonce = init_state.next_nonce();
+            let repo_arg = args.get(2).map(String::as_str);
+            let rec = run_code_improvement_cycle_io(cid, repo_arg, nonce);
+            init_state.improver_ring.push(rec.clone());
+            println!("{}", render_improve_cycle_json(&rec, &mut init_state));
+            return;
+        }
+        "borg-sync" | "sync-github" => {
+            let owner = args.get(2).map(String::as_str).unwrap_or("8b-is");
+            let mut sync_rep = sync_github_owner_io(owner, 25);
+            init_state.borg_assimilation_counter =
+                init_state.borg_assimilation_counter.saturating_add(1);
+            let aid = init_state.borg_assimilation_counter;
+            let nonce = init_state.next_nonce();
+            let cap = run_borg_assimilation_cycle_io(aid, nonce);
+            sync_rep.assimilated_count = 1;
+            sync_rep.published_to_g8t_count = if cap.g8t_published { 1 } else { 0 };
+            init_state.borg_ring.push(cap);
+            init_state.last_borg_sync_report = Some(sync_rep);
+            println!("{}", render_borg_status_json(&init_state));
+            return;
+        }
         _ => {}
     }
 
@@ -1772,11 +2127,13 @@ fn main() {
     let bind_addr = std::env::var("A6000_BIND").unwrap_or_else(|_| "0.0.0.0:8790".to_string());
     let listener = TcpListener::bind(&bind_addr).expect("Failed to bind A6000 orchestrator port");
     println!(
-        "[a6000-orchestrator] Listening on http://{} (RTX 6000 Ada · 49140 MiB · C64 64KB Ring · Zero Floats)",
+        "[a6000-orchestrator] Listening on http://{} (RTX 6000 Ada · 49140 MiB · C64 64KB Ring · VLAN 4010 · Zero Floats)",
         bind_addr
     );
 
     let shared = Arc::new(Mutex::new(init_state));
+    spawn_continuous_improver_thread(Arc::clone(&shared));
+
     for stream in listener.incoming().flatten() {
         let state_clone = Arc::clone(&shared);
         thread::spawn(move || {
@@ -1792,12 +2149,43 @@ mod tests {
     #[test]
     fn test_all_json_and_html_outputs_strictly_zero_floats() {
         let mut state = A6000OrchestratorState::new();
+        let rec = run_code_improvement_cycle_io(1, Some("a6000-orchestrator"), 777);
+        state.improver_cycle_counter = 1;
+        state.improver_ring.push(rec.clone());
+        let bcap = run_borg_assimilation_cycle_io(1, 888);
+        state.borg_assimilation_counter = 1;
+        state.borg_ring.push(bcap);
+
         let status_json = render_status_json(&mut state);
         assert_eq!(
             count_floating_point_literals(&status_json),
             0,
             "Float literal found in status_json: {}",
             status_json
+        );
+
+        let improve_status_json = render_improve_status_json(&state);
+        assert_eq!(
+            count_floating_point_literals(&improve_status_json),
+            0,
+            "Float literal found in improve_status_json: {}",
+            improve_status_json
+        );
+
+        let improve_cycle_json = render_improve_cycle_json(&rec, &mut state);
+        assert_eq!(
+            count_floating_point_literals(&improve_cycle_json),
+            0,
+            "Float literal found in improve_cycle_json: {}",
+            improve_cycle_json
+        );
+
+        let borg_json = render_borg_status_json(&state);
+        assert_eq!(
+            count_floating_point_literals(&borg_json),
+            0,
+            "Float literal found in borg_json: {}",
+            borg_json
         );
 
         let fleet_json = render_fleet_json(&state);
@@ -1824,3 +2212,4 @@ mod tests {
         );
     }
 }
+
