@@ -114,6 +114,9 @@ fn print_usage() {
     println!("  improve-status      Subsystem F: Inspect Continuous Improver Summary & Recent 64-Slot Ring Records");
     println!("  borg-sync [owner]   Subsystem G: Pure-Rust sync-github onto 160 TB VLAN 4010 Vault + Borg Assimilator");
     println!("  borg-status         Subsystem G: Inspect Hetzner VLAN 4010 (160 TB) Link & Borg-Assimilated Capsules");
+    println!("  domains [reconcile] Subsystem H: Namecheap (lumisst) Registrar & ns1..ns4·i1·is (i1-dns) Zone Reconciler");
+    println!("  commitments         Subsystem I: Inspect MEM|8 16-Byte Normative Commitments & 3-Op Continuation Guard");
+    println!("  commitment-transition [id] [state] [justification] [sig]  Subsystem I: Transition MEM|8 Commitment");
 }
 
 fn main() {
@@ -158,6 +161,39 @@ fn main() {
             ("POST", format!("/a6000/api/borg/sync?owner={}", owner))
         }
         "borg-status" | "borg" => ("GET", "/a6000/api/borg/status".to_string()),
+        "domains" => {
+            let sub = args.get(2).map(String::as_str).unwrap_or("");
+            if sub == "reconcile" {
+                ("POST", "/api/a6000/domains/reconcile".to_string())
+            } else if sub == "check" {
+                let d = args.get(3).map(|s| sanitize_arg(s)).unwrap_or_else(|| "sovereign-8b.is".to_string());
+                ("GET", format!("/api/a6000/domains?check={}", d))
+            } else if sub == "create" {
+                let d = args.get(3).map(|s| sanitize_arg(s)).unwrap_or_else(|| "sovereign-8b.is".to_string());
+                ("POST", format!("/api/a6000/domains/reconcile?create={}", d))
+            } else {
+                ("GET", "/api/a6000/domains".to_string())
+            }
+        }
+        "domains-reconcile" => ("POST", "/api/a6000/domains/reconcile".to_string()),
+        "commitments" => ("GET", "/api/a6000/commitments".to_string()),
+        "commitment-transition" | "transition" => {
+            let id = args.get(2).map(|s| sanitize_arg(s)).unwrap_or_default();
+            let st = args.get(3).map(|s| sanitize_arg(s)).unwrap_or_default();
+            let just = args.get(4).map(|s| sanitize_arg(s)).unwrap_or_default();
+            let sig = args.get(5).map(|s| sanitize_arg(s)).unwrap_or_default();
+            if !id.is_empty() && !st.is_empty() {
+                (
+                    "POST",
+                    format!(
+                        "/api/a6000/commitments/transition?id={}&target_state={}&justification={}&counterparty_sig_hash={}",
+                        id, st, just, sig
+                    ),
+                )
+            } else {
+                ("POST", "/api/a6000/commitments/transition".to_string())
+            }
+        }
         "-h" | "--help" | "help" => {
             print_usage();
             return;

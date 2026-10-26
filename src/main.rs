@@ -27,6 +27,8 @@ pub struct A6000OrchestratorState {
     pub borg_ring: RingBuffer<BorgAssimilatedCapsule, 64>,
     pub borg_assimilation_counter: u64,
     pub last_borg_sync_report: Option<BorgSyncReport>,
+    pub last_domains_report: Option<LumisstDomainReconcileReport>,
+    pub commitments: Vec<NormativeCommitment>,
 }
 
 impl A6000OrchestratorState {
@@ -98,6 +100,7 @@ impl A6000OrchestratorState {
 
         let (improver_ring, improver_cycle_counter) = load_persisted_improver_records();
         let (borg_ring, borg_assimilation_counter) = load_persisted_borg_capsules();
+        let commitments = default_normative_commitments();
 
         let mut state = Self {
             c64_page,
@@ -116,6 +119,8 @@ impl A6000OrchestratorState {
             borg_ring,
             borg_assimilation_counter,
             last_borg_sync_report: None,
+            last_domains_report: None,
+            commitments,
         };
 
         let (_, sample) = query_nvidia_smi_tick(1);
@@ -1318,6 +1323,255 @@ pub fn render_borg_status_json(state: &A6000OrchestratorState) -> String {
     )
 }
 
+pub fn render_domains_json(
+    state: &mut A6000OrchestratorState,
+    repoint_ns: bool,
+    check_domain: Option<&str>,
+    create_domain: Option<&str>,
+) -> String {
+    if !repoint_ns && check_domain.is_none() && create_domain.is_none() {
+        if let Some(ref cached) = state.last_domains_report {
+            return cached.to_json();
+        }
+    }
+    let rep = reconcile_lumisst_domains_and_zones_io(repoint_ns, check_domain, create_domain);
+    state.c64_page.write_record(&format!(
+        "DOMAINS_RECONCILE:USER={}:DOMAINS={}:ZONES={}:DELEGATED={}",
+        rep.config.username,
+        rep.domains.len(),
+        rep.zones_verified_count,
+        rep.delegation_ratio_pq
+    ));
+    let json = rep.to_json();
+    state.last_domains_report = Some(rep);
+    json
+}
+
+pub fn render_commitments_json(
+    state: &A6000OrchestratorState,
+    force_blocked_continuation: bool,
+) -> String {
+    let items: Vec<String> = state.commitments.iter().map(|c| c.to_json()).collect();
+    let active_count = state
+        .commitments
+        .iter()
+        .filter(|c| c.state == CommitmentState::Active)
+        .count();
+    let binding_count = state
+        .commitments
+        .iter()
+        .filter(|c| c.state.is_binding())
+        .count();
+    let eval_normal =
+        evaluate_continuation(&state.commitments, &default_continuation_candidates(false));
+    let eval_blocked =
+        evaluate_continuation(&state.commitments, &default_continuation_candidates(true));
+    let primary_eval = if force_blocked_continuation {
+        &eval_blocked
+    } else {
+        &eval_normal
+    };
+
+    format!(
+        "{{\"ok\":true,\"float_count\":0,\"subsystem\":\"SUBSYSTEM_I_MEM8_NORMATIVE_COMMITMENT_KERNEL\",\"frame_size_bytes\":16,\"state_bits\":3,\"normative_persistence_law\":\"informational_resolution_pq decays over time; normative_strength_pq (1/1) never decays with time alone\",\"total_commitments\":{},\"active_commitments_count\":{},\"binding_commitments_count\":{},\"commitments\":[{}],\"continuation_guard\":{},\"continuation_guard_when_blocked\":{}}}",
+        state.commitments.len(),
+        active_count,
+        binding_count,
+        items.join(","),
+        primary_eval.to_json(),
+        eval_blocked.to_json()
+    )
+}
+
+fn url_decode_param(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(h, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+pub fn execute_commitment_transition(
+    state: &mut A6000OrchestratorState,
+    raw_path: &str,
+    req_body: &str,
+) -> String {
+    let q_id = extract_query_param(raw_path, "id")
+        .or_else(|| extract_query_param(raw_path, "commitment_id"))
+        .and_then(|s| s.parse::<u16>().ok());
+    let b_id = {
+        let v = extract_json_u64(req_body, "commitment_id", 0);
+        if v > 0 {
+            Some(v as u16)
+        } else {
+            let v2 = extract_json_u64(req_body, "id", 0);
+            if v2 > 0 {
+                Some(v2 as u16)
+            } else {
+                None
+            }
+        }
+    };
+    let target_id = q_id.or(b_id);
+
+    let target_state_str = extract_query_param(raw_path, "target_state")
+        .or_else(|| extract_query_param(raw_path, "state"))
+        .or_else(|| extract_json_string_field(req_body, "target_state"))
+        .or_else(|| extract_json_string_field(req_body, "state"));
+
+    let justification = extract_query_param(raw_path, "justification")
+        .or_else(|| extract_json_string_field(req_body, "justification"))
+        .unwrap_or_default();
+
+    let counterparty_sig_hash = extract_query_param(raw_path, "counterparty_sig_hash")
+        .or_else(|| extract_query_param(raw_path, "sig"))
+        .or_else(|| extract_json_string_field(req_body, "counterparty_sig_hash"))
+        .unwrap_or_default();
+
+    let advance_ticks = extract_query_param(raw_path, "advance_ticks")
+        .or_else(|| extract_query_param(raw_path, "elapsed_ticks"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| extract_json_u64(req_body, "advance_ticks", 0));
+
+    let force_blocked = extract_query_param(raw_path, "force_blocked")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or_else(|| extract_json_bool(req_body, "force_blocked", false));
+
+    // Support proposing a brand-new commitment if `clause` is supplied and `id` is omitted
+    if target_id.is_none() {
+        if let Some(new_clause) = extract_query_param(raw_path, "clause")
+            .or_else(|| extract_json_string_field(req_body, "clause"))
+        {
+            let next_id = (state.commitments.len() as u16).saturating_add(1);
+            let promisor = extract_query_param(raw_path, "promisor")
+                .or_else(|| extract_json_string_field(req_body, "promisor"))
+                .unwrap_or_else(|| "aye-a6000-prime".to_string());
+            let counterparty = extract_query_param(raw_path, "counterparty")
+                .or_else(|| extract_json_string_field(req_body, "counterparty"))
+                .unwrap_or_else(|| "hue@8b.is".to_string());
+            let init_state = target_state_str
+                .as_deref()
+                .and_then(|s| CommitmentState::from_str_name(s).ok())
+                .unwrap_or(CommitmentState::Proposed);
+            let created = NormativeCommitment::new(
+                next_id,
+                init_state,
+                &promisor,
+                &counterparty,
+                &new_clause,
+                advance_ticks,
+                &justification,
+                &counterparty_sig_hash,
+            );
+            let created_json = created.to_json();
+            state.commitments.push(created);
+            state.c64_page.write_record(&format!(
+                "COMMITMENT_NEW:ID={}:STATE={}",
+                next_id,
+                init_state.as_str()
+            ));
+            let guard_rep = evaluate_continuation(
+                &state.commitments,
+                &default_continuation_candidates(force_blocked),
+            );
+            return format!(
+                "{{\"ok\":true,\"float_count\":0,\"transition_accepted\":true,\"commitment\":{},\"continuation_guard\":{}}}",
+                created_json,
+                guard_rep.to_json()
+            );
+        }
+    }
+
+    // Default interactive transition when invoked with no parameters (e.g., Command Deck button or bare CLI)
+    let resolved_id = target_id.unwrap_or(4);
+    let Some(pos) = state
+        .commitments
+        .iter()
+        .position(|c| c.commitment_id == resolved_id)
+    else {
+        return "{\"ok\":false,\"float_count\":0,\"transition_accepted\":false,\"error\":\"commitment_not_found\"}".to_string();
+    };
+
+    if advance_ticks > 0 {
+        state.commitments[pos].advance_time(advance_ticks);
+    } else if target_id.is_none() && target_state_str.is_none() {
+        // Demonstrate informational decay without normative decay on bare call
+        state.commitments[pos].advance_time(64);
+    }
+
+    let transition_result = if let Some(ref st_name) = target_state_str {
+        match CommitmentState::from_str_name(st_name) {
+            Ok(target_st) => {
+                state.commitments[pos].transition(target_st, &justification, &counterparty_sig_hash)
+            }
+            Err(e) => Err(e),
+        }
+    } else if state.commitments[pos].state == CommitmentState::Proposed {
+        state.commitments[pos].transition(CommitmentState::Accepted, &justification, &counterparty_sig_hash)
+    } else if state.commitments[pos].state == CommitmentState::Accepted {
+        state.commitments[pos].transition(CommitmentState::Active, &justification, &counterparty_sig_hash)
+    } else {
+        Ok(state.commitments[pos].normative_trit)
+    };
+
+    match transition_result {
+        Ok(trit) => {
+            let updated_json = state.commitments[pos].to_json();
+            let st_str = state.commitments[pos].state.as_str();
+            state.c64_page.write_record(&format!(
+                "COMMITMENT_TRANSITION:ID={}:STATE={}:INFO_PQ={}:NORM_PQ={}:TRIT={}",
+                resolved_id,
+                st_str,
+                state.commitments[pos].informational_resolution_pq,
+                state.commitments[pos].normative_strength_pq,
+                trit.as_glyph()
+            ));
+            let guard_rep = evaluate_continuation(
+                &state.commitments,
+                &default_continuation_candidates(force_blocked || target_id.is_none()),
+            );
+            format!(
+                "{{\"ok\":true,\"float_count\":0,\"transition_accepted\":true,\"commitment\":{},\"continuation_guard\":{}}}",
+                updated_json,
+                guard_rep.to_json()
+            )
+        }
+        Err(err_msg) => {
+            let current_json = state.commitments[pos].to_json();
+            state.c64_page.write_record(&format!(
+                "COMMITMENT_GUARD_PRUNED:ID={}:REASON={}",
+                resolved_id, err_msg
+            ));
+            // When a transition is blocked, Operation 3 (Creation) synthesizes a legitimate right-side door!
+            let guard_rep =
+                evaluate_continuation(&state.commitments, &default_continuation_candidates(true));
+            format!(
+                "{{\"ok\":false,\"float_count\":0,\"transition_accepted\":false,\"error\":\"{}\",\"commitment\":{},\"continuation_guard\":{}}}",
+                json_escape(&err_msg.replace('.', "·")),
+                current_json,
+                guard_rep.to_json()
+            )
+        }
+    }
+}
+
 // ============================================================================
 // INTERACTIVE DARK-MODE COMMAND DECK HTML (ZERO FLOATS IN HTML/CSS/JS)
 // ============================================================================
@@ -1420,8 +1674,8 @@ pub fn render_command_deck_html() -> &'static str {
       <span class="badge badge-green">Strict 8b·is No-Float Law (float_count = 0)</span>
       <span class="badge badge-green">RTX 6000 Ada Resident (keep_alive = -1)</span>
       <span class="badge">Hetzner VLAN 4010 (vSwitch #71596 · 160 TB Link)</span>
-      <span class="badge">Subsystem F Continuous Improver (45s Cadence)</span>
-      <span class="badge">The Borg Polyglot Code Assimilator</span>
+      <span class="badge">Namecheap lumisst + ns1..ns4·i1·is Reconciler</span>
+      <span class="badge">MEM|8 16-Byte Normative Commitment Kernel</span>
     </div>
   </header>
 
@@ -1437,8 +1691,36 @@ pub fn render_command_deck_html() -> &'static str {
       <button class="btn-purple" onclick="runAction('/a6000/api/improve/cycle')">[6] RUN A6000 GPU CODE IMPROVE CYCLE</button>
       <button class="btn-teal" onclick="runAction('/a6000/api/borg/sync')">[7] BORG ASSIMILATE + SYNC-GITHUB (160 TB VLAN 4010)</button>
       <button onclick="runAction('/a6000/api/backup/verify')">[8] Verify 321-File Backup Vaults</button>
+      <button class="btn-teal" onclick="runAction('/api/a6000/domains/reconcile')">[9] Reconcile lumisst Domains + ns1..ns4·i1·is Zones</button>
+      <button class="btn-purple" onclick="runAction('/api/a6000/commitments/transition')">[10] Evaluate MEM|8 Normative Commitment Guard</button>
     </div>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM H · NAMECHEAP (lumisst) REGISTRAR &amp; AUTHORITATIVE ns1..ns4·i1·is (i1-dns) ZONE CONTROLLER</h2>
+    <div id="domains-summary">Loading Namecheap lumisst &amp; ns1..ns4·i1·is authoritative zone status...</div>
+    <table id="domains-table">
+      <thead>
+        <tr>
+          <th>ID</th><th>Domain (SLD·TLD)</th><th>Owner</th><th>Nameservers</th><th>Authoritative Zone Path</th><th>Expires</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM I · MEM|8 NORMATIVE COMMITMENT KERNEL (16-BYTE FRAME) &amp; 3-OPERATION CONTINUATION GUARD</h2>
+    <div id="commitments-summary">Loading MEM|8 Normative Commitments &amp; 3-Operation Continuation Guard...</div>
+    <table id="commitments-table">
+      <thead>
+        <tr>
+          <th>ID</th><th>State (3-Bit)</th><th>Promisor -&gt; Counterparty</th><th>Clause</th><th>Info Resolution (p/q)</th><th>Normative Strength (p/q)</th><th>16-Byte Frame Hex</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
@@ -1554,6 +1836,47 @@ async function refreshAll() {
     }
     document.getElementById('c64-log').textContent = (st.c64_ring.recent_events || []).join('\n');
 
+    const dm = await fetchJson('/api/a6000/domains', 'GET');
+    document.getElementById('domains-summary').innerHTML =
+      '<div><b>Registrar Account:</b> ' + dm.registrar.account + ' (' + dm.registrar.env_path + ' · ClientIp: ' + dm.registrar.client_ip + ') · Balance (p/q USD): <b>' + dm.balance.available_balance_pq + '</b> (' + dm.balance.available_balance_cents + ' cents)</div>' +
+      '<div><b>Authoritative Mesh:</b> <code>' + dm.nameserver_csv + '</code> · Delegated Ratio: <b>' + dm.delegation_ratio_pq + '</b> · Active i1-dns Zones: <b>' + dm.zone_coverage_ratio_pq + '</b></div>';
+    const dbody = document.querySelector('#domains-table tbody');
+    dbody.innerHTML = '';
+    for (const d of (dm.domains || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>#' + d.domain_id + '</td>' +
+        '<td><b>' + d.domain + '</b> (' + d.sld + ' / ' + d.tld + ')</td>' +
+        '<td>' + d.owner_user + '</td>' +
+        '<td><code>' + d.nameservers.join(', ') + '</code></td>' +
+        '<td><code>' + d.zone_file_path + '</code></td>' +
+        '<td>' + d.expires_date + '</td>' +
+        '<td class="' + tritClass(d.status_trit) + '">' + d.status_trit_glyph + ' (' + d.status_trit + ')</td>';
+      dbody.appendChild(tr);
+    }
+
+    const cm = await fetchJson('/api/a6000/commitments', 'GET');
+    const cg = cm.continuation_guard_when_blocked;
+    const door = cg.creation_new_door_on_right_side;
+    document.getElementById('commitments-summary').innerHTML =
+      '<div><b>Normative Persistence Law:</b> ' + cm.normative_persistence_law + '</div>' +
+      '<div><b>3-Op Continuation Guard:</b> Admissible = <b>' + cm.continuation_guard.admissible_count + '</b> · Pruned Violations = <b>' + cm.continuation_guard.pruned_violation_count + '</b> · Right-Side Creation Door: <b><code>' + (door ? door.action_name : 'ready') + '</code></b></div>';
+    const cbody = document.querySelector('#commitments-table tbody');
+    cbody.innerHTML = '';
+    for (const c of (cm.commitments || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>#' + c.commitment_id + '</td>' +
+        '<td><b>' + c.state + '</b> (bits=' + c.state_bits_u8 + ')</td>' +
+        '<td>' + c.promisor + ' -&gt; ' + c.counterparty + '</td>' +
+        '<td>' + c.clause + '</td>' +
+        '<td><b>' + c.informational_resolution_pq + '</b> (t=' + c.elapsed_ticks + ')</td>' +
+        '<td><b>' + c.normative_strength_pq + '</b></td>' +
+        '<td><code>' + c.frame_hex + '</code></td>' +
+        '<td class="' + tritClass(c.normative_trit) + '">' + c.normative_trit_glyph + ' (' + c.normative_trit + ')</td>';
+      cbody.appendChild(tr);
+    }
+
     const imp = await fetchJson('/a6000/api/improve/status', 'GET');
     const sm = imp.summary;
     document.getElementById('improver-summary').innerHTML =
@@ -1667,7 +1990,7 @@ fn extract_query_param(raw_path: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some(val) = pair.strip_prefix(&prefix) {
             if !val.is_empty() {
-                return Some(val.to_string());
+                return Some(url_decode_param(val));
             }
         }
     }
@@ -1685,6 +2008,7 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
     };
 
     let req_str = String::from_utf8_lossy(&buf[..n]);
+    let req_body = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim();
     let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
     let mut parts = first_line.split_whitespace();
     let raw_method = parts.next().unwrap_or("GET");
@@ -1712,13 +2036,66 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
             "application/json; charset=utf-8",
             "{\"ok\":true,\"service\":\"a6000-orchestrator\",\"host\":\"49.13.101.247\",\"gpu\":\"NVIDIA RTX 6000 Ada Generation\",\"vram_total_mib\":49140,\"vcpu_count\":48,\"c64_ram_ceiling_bytes\":65536,\"float_count\":0}".to_string(),
         ),
-        (_, "/a6000/api/status") | (_, "/api/status") => {
+        (_, "/a6000/api/status") | (_, "/api/status") | (_, "/api/a6000/status") => {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             (
                 "HTTP/1.1 200 OK",
                 "application/json; charset=utf-8",
                 render_status_json(&mut guard),
             )
+        }
+        ("GET", "/api/a6000/domains")
+        | ("GET", "/a6000/api/domains")
+        | ("GET", "/api/domains") => {
+            let chk = extract_query_param(raw_path, "check");
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                "HTTP/1.1 200 OK",
+                "application/json; charset=utf-8",
+                render_domains_json(&mut guard, false, chk.as_deref(), None),
+            )
+        }
+        (_, "/api/a6000/domains/reconcile")
+        | (_, "/a6000/api/domains/reconcile")
+        | (_, "/api/domains/reconcile") => {
+            let chk = extract_query_param(raw_path, "check")
+                .or_else(|| extract_json_string_field(req_body, "check"));
+            let crt = extract_query_param(raw_path, "create")
+                .or_else(|| extract_query_param(raw_path, "domain"))
+                .or_else(|| extract_json_string_field(req_body, "create"))
+                .or_else(|| extract_json_string_field(req_body, "domain"));
+            let rep = reconcile_lumisst_domains_and_zones_io(true, chk.as_deref(), crt.as_deref());
+            let json = rep.to_json();
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.c64_page.write_record(&format!(
+                "DOMAINS_RECONCILE:USER={}:DOMAINS={}:ZONES={}:DELEGATED={}",
+                rep.config.username,
+                rep.domains.len(),
+                rep.zones_verified_count,
+                rep.delegation_ratio_pq
+            ));
+            guard.last_domains_report = Some(rep);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        ("GET", "/api/a6000/commitments")
+        | ("GET", "/a6000/api/commitments")
+        | ("GET", "/api/commitments") => {
+            let force_blocked = extract_query_param(raw_path, "force_blocked")
+                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                .unwrap_or(false);
+            let guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                "HTTP/1.1 200 OK",
+                "application/json; charset=utf-8",
+                render_commitments_json(&guard, force_blocked),
+            )
+        }
+        (_, "/api/a6000/commitments/transition")
+        | (_, "/a6000/api/commitments/transition")
+        | (_, "/api/commitments/transition") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = execute_commitment_transition(&mut guard, raw_path, req_body);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
         ("GET", "/a6000/api/improve/status")
         | ("GET", "/api/improve/status")
@@ -2117,12 +2494,32 @@ fn main() {
             println!("{}", render_borg_status_json(&init_state));
             return;
         }
+        "domains" | "domains-reconcile" => {
+            let action = args.get(2).map(String::as_str).unwrap_or("reconcile");
+            let dom = args.get(3).map(String::as_str);
+            let json = match action {
+                "check" => render_domains_json(&mut init_state, false, dom, None),
+                "create" => render_domains_json(&mut init_state, true, None, dom),
+                _ => render_domains_json(&mut init_state, true, None, None),
+            };
+            println!("{}", json);
+            return;
+        }
+        "commitments" => {
+            println!("{}", render_commitments_json(&init_state, false));
+            return;
+        }
+        "commitment-transition" => {
+            println!("{}", execute_commitment_transition(&mut init_state, "/api/a6000/commitments/transition", ""));
+            return;
+        }
         _ => {}
     }
 
-    // Pre-warm initial fleet TCP probe and backup check on startup
+    // Pre-warm initial fleet TCP probe, backup check, and lumisst i1-dns zone catalog on startup
     probe_all_fleet_nodes(&mut init_state, false);
     let _ = verify_backup_vaults(&mut init_state);
+    let _ = render_domains_json(&mut init_state, true, None, None);
 
     let bind_addr = std::env::var("A6000_BIND").unwrap_or_else(|_| "0.0.0.0:8790".to_string());
     let listener = TcpListener::bind(&bind_addr).expect("Failed to bind A6000 orchestrator port");
@@ -2204,6 +2601,50 @@ mod tests {
             toss_json
         );
 
+        let domains_json = render_domains_json(&mut state, true, Some("sovereign-8b.is"), None);
+        assert_eq!(
+            count_floating_point_literals(&domains_json),
+            0,
+            "Float literal found in domains_json: {}",
+            domains_json
+        );
+
+        let commitments_json = render_commitments_json(&state, false);
+        assert_eq!(
+            count_floating_point_literals(&commitments_json),
+            0,
+            "Float literal found in commitments_json: {}",
+            commitments_json
+        );
+
+        let transition_ok_json = execute_commitment_transition(
+            &mut state,
+            "/api/a6000/commitments/transition?id=4&target_state=Active&advance_ticks=64",
+            "",
+        );
+        assert!(transition_ok_json.contains("\"transition_accepted\":true"));
+        assert_eq!(
+            count_floating_point_literals(&transition_ok_json),
+            0,
+            "Float literal found in transition_ok_json: {}",
+            transition_ok_json
+        );
+
+        // Verify transition out of Active without justification/sig is rejected and synthesizes right-side door
+        let transition_blocked_json = execute_commitment_transition(
+            &mut state,
+            "/api/a6000/commitments/transition?id=1&target_state=Released",
+            "",
+        );
+        assert!(transition_blocked_json.contains("\"transition_accepted\":false"));
+        assert!(transition_blocked_json.contains("open_right_side_cooperative_door"));
+        assert_eq!(
+            count_floating_point_literals(&transition_blocked_json),
+            0,
+            "Float literal found in transition_blocked_json: {}",
+            transition_blocked_json
+        );
+
         let html = render_command_deck_html();
         assert_eq!(
             count_floating_point_literals(html),
@@ -2212,4 +2653,5 @@ mod tests {
         );
     }
 }
+
 
