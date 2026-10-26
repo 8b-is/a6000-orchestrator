@@ -1443,12 +1443,20 @@ pub fn execute_commitment_transition(
     let counterparty_sig_hash = extract_query_param(raw_path, "counterparty_sig_hash")
         .or_else(|| extract_query_param(raw_path, "sig"))
         .or_else(|| extract_json_string_field(req_body, "counterparty_sig_hash"))
+        .or_else(|| extract_json_string_field(req_body, "sig"))
         .unwrap_or_default();
 
     let advance_ticks = extract_query_param(raw_path, "advance_ticks")
         .or_else(|| extract_query_param(raw_path, "elapsed_ticks"))
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| extract_json_u64(req_body, "advance_ticks", 0));
+        .unwrap_or_else(|| {
+            let t1 = extract_json_u64(req_body, "advance_ticks", 0);
+            if t1 > 0 {
+                t1
+            } else {
+                extract_json_u64(req_body, "elapsed_ticks", 0)
+            }
+        });
 
     let force_blocked = extract_query_param(raw_path, "force_blocked")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
@@ -1459,17 +1467,50 @@ pub fn execute_commitment_transition(
         if let Some(new_clause) = extract_query_param(raw_path, "clause")
             .or_else(|| extract_json_string_field(req_body, "clause"))
         {
-            let next_id = (state.commitments.len() as u16).saturating_add(1);
+            let init_state = match target_state_str.as_deref() {
+                Some(s) => match CommitmentState::from_str_name(s) {
+                    Ok(st) => st,
+                    Err(err_msg) => {
+                        let guard_rep = evaluate_continuation(
+                            &state.commitments,
+                            &default_continuation_candidates(true),
+                        );
+                        return format!(
+                            "{{\"ok\":false,\"float_count\":0,\"transition_accepted\":false,\"error\":\"{}\",\"continuation_guard\":{}}}",
+                            json_escape(&err_msg.replace('.', "·")),
+                            guard_rep.to_json()
+                        );
+                    }
+                },
+                None => CommitmentState::Proposed,
+            };
+
+            if init_state.requires_justification_and_sig()
+                && (justification.trim().is_empty() || counterparty_sig_hash.trim().is_empty())
+            {
+                let guard_rep = evaluate_continuation(
+                    &state.commitments,
+                    &default_continuation_candidates(true),
+                );
+                return format!(
+                    "{{\"ok\":false,\"float_count\":0,\"transition_accepted\":false,\"error\":\"creating post-Active commitment requires non-empty justification and counterparty_sig_hash\",\"continuation_guard\":{}}}",
+                    guard_rep.to_json()
+                );
+            }
+
+            let next_id = state
+                .commitments
+                .iter()
+                .map(|c| c.commitment_id)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
             let promisor = extract_query_param(raw_path, "promisor")
                 .or_else(|| extract_json_string_field(req_body, "promisor"))
                 .unwrap_or_else(|| "aye-a6000-prime".to_string());
             let counterparty = extract_query_param(raw_path, "counterparty")
                 .or_else(|| extract_json_string_field(req_body, "counterparty"))
                 .unwrap_or_else(|| "hue@8b.is".to_string());
-            let init_state = target_state_str
-                .as_deref()
-                .and_then(|s| CommitmentState::from_str_name(s).ok())
-                .unwrap_or(CommitmentState::Proposed);
             let created = NormativeCommitment::new(
                 next_id,
                 init_state,
@@ -1500,7 +1541,14 @@ pub fn execute_commitment_transition(
     }
 
     // Default interactive transition when invoked with no parameters (e.g., Command Deck button or bare CLI)
-    let resolved_id = target_id.unwrap_or(4);
+    let resolved_id = target_id.unwrap_or_else(|| {
+        state
+            .commitments
+            .iter()
+            .find(|c| c.state == CommitmentState::Proposed || c.state == CommitmentState::Accepted)
+            .map(|c| c.commitment_id)
+            .unwrap_or(4)
+    });
     let Some(pos) = state
         .commitments
         .iter()
@@ -1997,17 +2045,68 @@ fn extract_query_param(raw_path: &str, key: &str) -> Option<String> {
     None
 }
 
+fn url_encode_query_val(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b',') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "%{:02X}", b);
+        }
+    }
+    out
+}
+
+fn read_http_request_bytes(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 4096];
+    let mut header_end: Option<usize> = None;
+    let mut content_length: usize = 0;
+
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        header_end = Some(end);
+                        let hdr_str = String::from_utf8_lossy(&buf[..end]);
+                        for line in hdr_str.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    content_length = v.trim().parse::<usize>().unwrap_or(0).min(16384);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end.saturating_add(content_length) || buf.len() >= 16384 {
+                        break;
+                    }
+                } else if buf.len() >= 16384 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000OrchestratorState>>) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let mut buf = [0u8; 8192];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
+    let raw_bytes = read_http_request_bytes(&mut stream);
+    if raw_bytes.is_empty() {
+        return;
+    }
 
-    let req_str = String::from_utf8_lossy(&buf[..n]);
+    let req_str = String::from_utf8_lossy(&raw_bytes);
     let req_body = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim();
     let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
     let mut parts = first_line.split_whitespace();
@@ -2510,7 +2609,24 @@ fn main() {
             return;
         }
         "commitment-transition" => {
-            println!("{}", execute_commitment_transition(&mut init_state, "/api/a6000/commitments/transition", ""));
+            let mut path = "/api/a6000/commitments/transition".to_string();
+            let mut qp = Vec::new();
+            if let Some(id) = args.get(2) {
+                qp.push(format!("id={}", url_encode_query_val(id)));
+            }
+            if let Some(st) = args.get(3) {
+                qp.push(format!("target_state={}", url_encode_query_val(st)));
+            }
+            if let Some(just) = args.get(4) {
+                qp.push(format!("justification={}", url_encode_query_val(just)));
+            }
+            if let Some(sig) = args.get(5) {
+                qp.push(format!("counterparty_sig_hash={}", url_encode_query_val(sig)));
+            }
+            if !qp.is_empty() {
+                path = format!("{}?{}", path, qp.join("&"));
+            }
+            println!("{}", execute_commitment_transition(&mut init_state, &path, ""));
             return;
         }
         _ => {}
@@ -2644,6 +2760,25 @@ mod tests {
             "Float literal found in transition_blocked_json: {}",
             transition_blocked_json
         );
+
+        // Verify creating a post-Active commitment directly without justification/sig is rejected
+        let create_post_active_blocked = execute_commitment_transition(
+            &mut state,
+            "/api/a6000/commitments/transition",
+            "{\"clause\":\"Bypass Active lifecycle\",\"target_state\":\"Released\"}",
+        );
+        assert!(create_post_active_blocked.contains("\"transition_accepted\":false"));
+        assert_eq!(count_floating_point_literals(&create_post_active_blocked), 0);
+
+        // Verify JSON body POST transition with whitespace before colons and float-like sig is sanitized
+        let json_body_transition = execute_commitment_transition(
+            &mut state,
+            "/api/a6000/commitments/transition",
+            "{ \"id\" : 4 , \"target_state\" : \"Fulfilled\" , \"justification\" : \"All 1/1 tests pass\" , \"counterparty_sig_hash\" : \"sig.v1.2\" }",
+        );
+        assert!(json_body_transition.contains("\"transition_accepted\":true"));
+        assert!(json_body_transition.contains("\"state\":\"Fulfilled\""));
+        assert_eq!(count_floating_point_literals(&json_body_transition), 0);
 
         let html = render_command_deck_html();
         assert_eq!(

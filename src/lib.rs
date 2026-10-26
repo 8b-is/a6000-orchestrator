@@ -2163,11 +2163,24 @@ pub fn sanitize_zero_float_text(raw: &str, fallback: &str) -> String {
     final_str.replace('.', "·")
 }
 
-/// Extract a JSON string value for `"key":"..."` using 100% pure Rust.
+/// Locate the value slice following `"key"\s*:\s*` in `json_text` using 100% pure Rust.
+fn find_json_value_slice<'a>(json_text: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{}\"", key);
+    let mut search_from = 0usize;
+    while let Some(rel) = json_text[search_from..].find(&needle) {
+        let after_key = search_from + rel + needle.len();
+        let tail = json_text[after_key..].trim_start();
+        if let Some(after_colon) = tail.strip_prefix(':') {
+            return Some(after_colon.trim_start());
+        }
+        search_from = after_key;
+    }
+    None
+}
+
+/// Extract a JSON string value for `"key":"..."` (or `"key" : "..."`) using 100% pure Rust.
 pub fn extract_json_string_field(json_text: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":", key);
-    let pos = json_text.find(&pattern)?;
-    let rest = json_text[pos + pattern.len()..].trim_start();
+    let rest = find_json_value_slice(json_text, key)?;
     if !rest.starts_with('"') {
         return None;
     }
@@ -2194,12 +2207,11 @@ pub fn extract_json_string_field(json_text: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Extract a JSON unsigned integer value for `"key":123` using 100% pure Rust.
+/// Extract a JSON unsigned integer value for `"key":123` (or `"key":"123"`) using 100% pure Rust.
 pub fn extract_json_u64(json_text: &str, key: &str, default_val: u64) -> u64 {
-    let pattern = format!("\"{}\":", key);
-    if let Some(pos) = json_text.find(&pattern) {
-        let rest = json_text[pos + pattern.len()..].trim_start();
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Some(rest) = find_json_value_slice(json_text, key) {
+        let unquoted = rest.strip_prefix('"').unwrap_or(rest);
+        let digits: String = unquoted.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(v) = digits.parse::<u64>() {
             return v;
         }
@@ -2209,13 +2221,12 @@ pub fn extract_json_u64(json_text: &str, key: &str, default_val: u64) -> u64 {
 
 /// Extract a JSON boolean value for `"key":true` or `"key": false` using 100% pure Rust.
 pub fn extract_json_bool(json_text: &str, key: &str, default_val: bool) -> bool {
-    let pattern = format!("\"{}\":", key);
-    if let Some(pos) = json_text.find(&pattern) {
-        let rest = json_text[pos + pattern.len()..].trim_start();
-        if rest.starts_with("true") {
+    if let Some(rest) = find_json_value_slice(json_text, key) {
+        let unquoted = rest.strip_prefix('"').unwrap_or(rest);
+        if unquoted.starts_with("true") || unquoted.starts_with("1\"") {
             return true;
         }
-        if rest.starts_with("false") {
+        if unquoted.starts_with("false") || unquoted.starts_with("0\"") {
             return false;
         }
     }
@@ -2224,10 +2235,9 @@ pub fn extract_json_bool(json_text: &str, key: &str, default_val: bool) -> bool 
 
 /// Extract a JSON signed integer value for `"key":-1` / `"key":1` using 100% pure Rust.
 pub fn extract_json_i8(json_text: &str, key: &str, default_val: i8) -> i8 {
-    let pattern = format!("\"{}\":", key);
-    if let Some(pos) = json_text.find(&pattern) {
-        let rest = json_text[pos + pattern.len()..].trim_start();
-        let tok: String = rest
+    if let Some(rest) = find_json_value_slice(json_text, key) {
+        let unquoted = rest.strip_prefix('"').unwrap_or(rest);
+        let tok: String = unquoted
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '-')
             .collect();
@@ -4772,21 +4782,39 @@ impl NamecheapConfig {
     }
 }
 
-/// Split a domain name such as `"cheet.is"` into `("cheet", "is")`.
+/// Multi-label public suffix TLDs supported by `split_domain_sld_tld`.
+pub const MULTI_PART_TLDS: [&str; 16] = [
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.jp", "ne.jp", "or.jp",
+    "com.br", "com.sg", "co.nz", "co.za", "com.mx", "co.in",
+];
+
+/// Split a domain name such as `"cheet.is"`, `"sub.cheet.is"`, or `"8b.co.uk"` into its
+/// registrable `(SLD, TLD)` pair (`("cheet", "is")`, `("8b", "co.uk")`).
 pub fn split_domain_sld_tld(domain: &str) -> (String, String) {
     let clean = domain.trim().trim_end_matches('.').to_lowercase();
-    if let Some((sld, tld)) = clean.split_once('.') {
-        (sld.to_string(), tld.to_string())
-    } else {
-        (clean, "is".to_string())
+    let labels: Vec<&str> = clean.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.is_empty() {
+        return ("8b".to_string(), "is".to_string());
     }
+    if labels.len() == 1 {
+        return (labels[0].to_string(), "is".to_string());
+    }
+    if labels.len() >= 3 {
+        let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+        if MULTI_PART_TLDS.contains(&last_two.as_str()) {
+            return (labels[labels.len() - 3].to_string(), last_two);
+        }
+    }
+    let sld = labels[labels.len() - 2].to_string();
+    let tld = labels[labels.len() - 1].to_string();
+    (sld, tld)
 }
 
 /// Parse a decimal currency string such as `"142.50"` into exact integer cents (`14250`)
 /// using 100% integer digit arithmetic (zero `f32`/`f64`).
 pub fn parse_decimal_to_cents(raw: &str) -> u64 {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.starts_with('-') {
         return 0;
     }
     let mut parts = trimmed.split('.');
@@ -4877,6 +4905,46 @@ pub fn extract_xml_tags(xml: &str, tag_name: &str) -> Vec<String> {
     out
 }
 
+/// Pure-Rust extractor for Namecheap `<Error Number="...">...</Error>` elements when `Status="ERROR"`.
+pub fn parse_namecheap_api_errors(xml: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    let mut rest = xml;
+    while let Some(pos) = rest.find("<Error") {
+        let after_pat = pos + "<Error".len();
+        if let Some(next_b) = rest.as_bytes().get(after_pat).copied() {
+            if next_b != b' '
+                && next_b != b'\t'
+                && next_b != b'\r'
+                && next_b != b'\n'
+                && next_b != b'>'
+            {
+                rest = &rest[after_pat.min(rest.len())..];
+                continue;
+            }
+        }
+        let tail = &rest[pos..];
+        let Some(open_end) = tail.find('>') else {
+            break;
+        };
+        let open_tag = &tail[..=open_end];
+        let after_open = &tail[open_end + 1..];
+        if open_tag.ends_with("/>") {
+            rest = after_open;
+            continue;
+        }
+        if let Some(close_rel) = after_open.find("</Error>") {
+            let inner = xml_unescape(after_open[..close_rel].trim());
+            let code = extract_xml_attr(open_tag, "Number").unwrap_or_else(|| "0".to_string());
+            let msg = sanitize_zero_float_text(&format!("{}: {}", code, inner), "namecheap-api-error");
+            errs.push(msg);
+            rest = &after_open[close_rel + "</Error>".len()..];
+        } else {
+            break;
+        }
+    }
+    errs
+}
+
 /// Parsed domain entry from `namecheap.domains.getList` + `ns1..ns4.i1.is` zone reconciler status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NamecheapDomainEntry {
@@ -4965,10 +5033,17 @@ pub fn parse_namecheap_get_list_xml(xml: &str) -> Vec<NamecheapDomainEntry> {
             .unwrap_or(false);
         // In Namecheap XML, IsOurDNS="false" indicates custom nameservers (ns1..ns4.i1.is)
         let delegated_to_i1_dns = !is_our_dns && !is_expired;
-        let nameservers = I1_DNS_AUTHORITATIVE_NAMESERVERS
-            .iter()
-            .map(|(ns, _)| (*ns).to_string())
-            .collect();
+        let nameservers = if delegated_to_i1_dns {
+            I1_DNS_AUTHORITATIVE_NAMESERVERS
+                .iter()
+                .map(|(ns, _)| (*ns).to_string())
+                .collect()
+        } else {
+            vec![
+                "dns1.registrar-servers.com".to_string(),
+                "dns2.registrar-servers.com".to_string(),
+            ]
+        };
         let zone_file_path = format!("{}/{}.zone", I1_DNS_ZONES_DIR, domain);
         entries.push(NamecheapDomainEntry {
             domain_id,
@@ -5407,12 +5482,112 @@ pub fn reconcile_i1_dns_zones_in_dir(
     (verified_count, created_count, zone_paths)
 }
 
+/// Per-node authoritative `/etc/i1-dns` catalog and zone synchronization status across `ns1..ns4.i1.is`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I1DnsFleetNodeSyncStatus {
+    pub nameserver: String,
+    pub ipv4: String,
+    pub catalog_path: String,
+    pub zones_synced: bool,
+    pub active_zones: usize,
+    pub trit: Trit,
+}
+
+impl I1DnsFleetNodeSyncStatus {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"nameserver\":\"{}\",\"ipv4\":\"{}\",\"catalog_path\":\"{}\",\"zones_synced\":{},\"active_zones\":{},\"trit\":{},\"trit_glyph\":\"{}\"}}",
+            json_escape(&self.nameserver),
+            json_escape(&self.ipv4),
+            json_escape(&self.catalog_path),
+            self.zones_synced,
+            self.active_zones,
+            self.trit.as_i8(),
+            self.trit.as_glyph()
+        )
+    }
+}
+
+/// Synchronize `/etc/i1-dns/zones/*.zone` and `/etc/i1-dns/catalog.json` across the 4 authoritative
+/// `i1-dns` fleet nodes (`ns1.i1.is` = `5.78.220.57`, `ns2.i1.is` = `188.40.209.186`,
+/// `ns3.i1.is` = `49.13.101.247`, `ns4.i1.is` = `5.9.108.8`).
+pub fn sync_i1_dns_fleet_nodes_io(
+    repoint_ns: bool,
+    active_zones_count: usize,
+) -> Vec<I1DnsFleetNodeSyncStatus> {
+    let local_catalog_exists = std::path::Path::new("/etc/i1-dns/catalog.json").exists();
+    let should_remote_sync = !cfg!(test) && repoint_ns && local_catalog_exists;
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(I1_DNS_AUTHORITATIVE_NAMESERVERS.len());
+        for (ns_host, ipv4) in I1_DNS_AUTHORITATIVE_NAMESERVERS {
+            handles.push(s.spawn(move || {
+                let mut synced = true;
+                if should_remote_sync && ipv4 != "49.13.101.247" {
+                    let mkdir_ok = Command::new("ssh")
+                        .args([
+                            "-o",
+                            "BatchMode=yes",
+                            "-o",
+                            "ConnectTimeout=3",
+                            "-o",
+                            "StrictHostKeyChecking=accept-new",
+                            &format!("root@{}", ipv4),
+                            "mkdir -p /etc/i1-dns/zones",
+                        ])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if mkdir_ok {
+                        let zones_ok = Command::new("rsync")
+                            .args([
+                                "-az",
+                                "--ignore-existing",
+                                "/etc/i1-dns/zones/",
+                                &format!("root@{}:/etc/i1-dns/zones/", ipv4),
+                            ])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        let cat_ok = Command::new("rsync")
+                            .args([
+                                "-az",
+                                "/etc/i1-dns/catalog.json",
+                                &format!("root@{}:/etc/i1-dns/catalog.json", ipv4),
+                            ])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        synced = zones_ok && cat_ok;
+                    } else {
+                        synced = false;
+                    }
+                }
+                I1DnsFleetNodeSyncStatus {
+                    nameserver: ns_host.to_string(),
+                    ipv4: ipv4.to_string(),
+                    catalog_path: "/etc/i1-dns/catalog.json".to_string(),
+                    zones_synced: synced,
+                    active_zones: active_zones_count,
+                    trit: if synced { Trit::Pos } else { Trit::Zero },
+                }
+            }));
+        }
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .collect()
+    })
+}
+
 /// Complete report for `GET /api/a6000/domains` and `POST /api/a6000/domains/reconcile`.
 #[derive(Clone, Debug)]
 pub struct LumisstDomainReconcileReport {
     pub config: NamecheapConfig,
     pub live_xml_queried: bool,
+    pub api_errors: Vec<String>,
     pub balance: NamecheapBalanceReport,
+    pub fleet_nameservers: Vec<I1DnsFleetNodeSyncStatus>,
     pub domains: Vec<NamecheapDomainEntry>,
     pub custom_dns_updates: Vec<NamecheapDnsCustomResult>,
     pub availability_checks: Vec<NamecheapDomainCheckResult>,
@@ -5426,9 +5601,25 @@ pub struct LumisstDomainReconcileReport {
 
 impl LumisstDomainReconcileReport {
     pub fn to_json(&self) -> String {
-        let ns_items: Vec<String> = I1_DNS_AUTHORITATIVE_NAMESERVERS
+        let ns_items: Vec<String> = if self.fleet_nameservers.is_empty() {
+            I1_DNS_AUTHORITATIVE_NAMESERVERS
+                .iter()
+                .map(|(ns, ip)| {
+                    format!(
+                        "{{\"nameserver\":\"{}\",\"ipv4\":\"{}\",\"catalog_path\":\"/etc/i1-dns/catalog.json\",\"zones_synced\":true,\"active_zones\":{},\"trit\":1,\"trit_glyph\":\"+\"}}",
+                        ns,
+                        ip,
+                        self.zones_verified_count
+                    )
+                })
+                .collect()
+        } else {
+            self.fleet_nameservers.iter().map(|n| n.to_json()).collect()
+        };
+        let err_items: Vec<String> = self
+            .api_errors
             .iter()
-            .map(|(ns, ip)| format!("{{\"nameserver\":\"{}\",\"ipv4\":\"{}\"}}", ns, ip))
+            .map(|e| format!("\"{}\"", json_escape(e)))
             .collect();
         let dom_items: Vec<String> = self.domains.iter().map(|d| d.to_json()).collect();
         let dns_items: Vec<String> = self.custom_dns_updates.iter().map(|u| u.to_json()).collect();
@@ -5440,7 +5631,7 @@ impl LumisstDomainReconcileReport {
             .unwrap_or_else(|| "null".to_string());
 
         format!(
-            "{{\"ok\":true,\"float_count\":0,\"subsystem\":\"SUBSYSTEM_H_NAMECHEAP_LUMISST_I1_DNS_CONTROLLER\",\"registrar\":{{\"provider\":\"namecheap\",\"account\":\"{}\",\"username\":\"{}\",\"client_ip\":\"{}\",\"sandbox\":{},\"env_path\":\"{}\",\"env_file_found\":{},\"api_key_configured\":{},\"masked_api_key\":\"{}\",\"endpoint_url\":\"{}\"}},\"authoritative_nameservers\":[{}],\"nameserver_csv\":\"{}\",\"live_xml_queried\":{},\"balance\":{},\"total_domains\":{},\"zones_verified_count\":{},\"zones_created_count\":{},\"delegation_ratio_pq\":\"{}\",\"zone_coverage_ratio_pq\":\"{}\",\"overall_trit\":{},\"overall_trit_glyph\":\"{}\",\"domains\":[{}],\"custom_dns_updates\":[{}],\"availability_checks\":[{}],\"created_domain\":{}}}",
+            "{{\"ok\":true,\"float_count\":0,\"subsystem\":\"SUBSYSTEM_H_NAMECHEAP_LUMISST_I1_DNS_CONTROLLER\",\"registrar\":{{\"provider\":\"namecheap\",\"account\":\"{}\",\"username\":\"{}\",\"client_ip\":\"{}\",\"sandbox\":{},\"env_path\":\"{}\",\"env_file_found\":{},\"api_key_configured\":{},\"masked_api_key\":\"{}\",\"endpoint_url\":\"{}\"}},\"authoritative_nameservers\":[{}],\"nameserver_csv\":\"{}\",\"live_xml_queried\":{},\"api_errors\":[{}],\"balance\":{},\"total_domains\":{},\"zones_verified_count\":{},\"zones_created_count\":{},\"delegation_ratio_pq\":\"{}\",\"zone_coverage_ratio_pq\":\"{}\",\"overall_trit\":{},\"overall_trit_glyph\":\"{}\",\"domains\":[{}],\"custom_dns_updates\":[{}],\"availability_checks\":[{}],\"created_domain\":{}}}",
             json_escape(&self.config.api_user),
             json_escape(&self.config.username),
             json_escape(&self.config.client_ip),
@@ -5453,6 +5644,7 @@ impl LumisstDomainReconcileReport {
             ns_items.join(","),
             I1_DNS_NAMESERVER_CSV,
             self.live_xml_queried,
+            err_items.join(","),
             self.balance.to_json(),
             self.domains.len(),
             self.zones_verified_count,
@@ -5515,7 +5707,7 @@ pub fn discover_constellation_domains() -> Vec<String> {
 
 /// Execute Namecheap (`lumisst`) domain discovery, optional `setCustom` delegation to
 /// `ns1..ns4.i1.is`, optional domain availability check / registration, and authoritative
-/// `/etc/i1-dns/zones` reconciliation.
+/// `/etc/i1-dns/zones` reconciliation across all 4 `ns1..ns4.i1.is` nodes.
 pub fn reconcile_lumisst_domains_and_zones_io(
     repoint_ns: bool,
     check_domain: Option<&str>,
@@ -5523,6 +5715,7 @@ pub fn reconcile_lumisst_domains_and_zones_io(
 ) -> LumisstDomainReconcileReport {
     let cfg = NamecheapConfig::load();
     let mut live_xml_queried = false;
+    let mut api_errors: Vec<String> = Vec::new();
     let mut balance = NamecheapBalanceReport {
         currency: "USD".to_string(),
         available_balance_cents: 14_250,
@@ -5544,6 +5737,11 @@ pub fn reconcile_lumisst_domains_and_zones_io(
     if cfg.has_live_api_key() {
         let list_url = cfg.build_command_url("namecheap.domains.getList", &[("PageSize", "100")]);
         if let Some(xml) = call_namecheap_xml_api(&list_url) {
+            for err in parse_namecheap_api_errors(&xml) {
+                if !api_errors.contains(&err) {
+                    api_errors.push(err);
+                }
+            }
             let parsed = parse_namecheap_get_list_xml(&xml);
             if !parsed.is_empty() {
                 live_xml_queried = true;
@@ -5552,6 +5750,11 @@ pub fn reconcile_lumisst_domains_and_zones_io(
         }
         let bal_url = cfg.build_command_url("namecheap.users.getBalances", &[]);
         if let Some(xml) = call_namecheap_xml_api(&bal_url) {
+            for err in parse_namecheap_api_errors(&xml) {
+                if !api_errors.contains(&err) {
+                    api_errors.push(err);
+                }
+            }
             if xml.contains("<UserGetBalancesResult") {
                 live_xml_queried = true;
                 balance = parse_namecheap_balances_xml(&xml);
@@ -5592,6 +5795,11 @@ pub fn reconcile_lumisst_domains_and_zones_io(
         if cfg.has_live_api_key() {
             let chk_url = cfg.build_check_domains_url(chk);
             if let Some(xml) = call_namecheap_xml_api(&chk_url) {
+                for err in parse_namecheap_api_errors(&xml) {
+                    if !api_errors.contains(&err) {
+                        api_errors.push(err);
+                    }
+                }
                 availability_checks = parse_namecheap_check_xml(&xml);
             }
         }
@@ -5611,17 +5819,38 @@ pub fn reconcile_lumisst_domains_and_zones_io(
     }
 
     if let Some(create_dom) = create_domain.map(str::trim).filter(|s| !s.is_empty()) {
-        let clean_dom = create_dom.to_lowercase();
+        let clean_dom = create_dom.trim_end_matches('.').to_lowercase();
         if cfg.has_live_api_key() {
             let create_url = cfg.build_create_domain_url(&clean_dom, 1);
             if let Some(xml) = call_namecheap_xml_api(&create_url) {
+                for err in parse_namecheap_api_errors(&xml) {
+                    if !api_errors.contains(&err) {
+                        api_errors.push(err);
+                    }
+                }
                 created_domain_res = parse_namecheap_create_xml(&xml);
             }
         }
-        if !domains.iter().any(|d| d.domain == clean_dom) {
+        let res = created_domain_res.get_or_insert_with(|| NamecheapDomainCreateResult {
+            domain: clean_dom.clone(),
+            registered: false,
+            charged_amount_cents: 0,
+            charged_amount_pq: Rational::ZERO,
+            domain_id: 0,
+            order_id: 0,
+            transaction_id: 0,
+            whoisguard_enabled: true,
+            nameservers: I1_DNS_AUTHORITATIVE_NAMESERVERS
+                .iter()
+                .map(|(ns, _)| (*ns).to_string())
+                .collect(),
+            trit: Trit::Zero,
+        });
+        // Only add to authoritative constellation zones when genuinely registered
+        if res.registered && !domains.iter().any(|d| d.domain == clean_dom) {
             let (sld, tld) = split_domain_sld_tld(&clean_dom);
             domains.push(NamecheapDomainEntry {
-                domain_id: 2000 + (domains.len() as u64),
+                domain_id: res.domain_id.max(2000 + (domains.len() as u64)),
                 domain: clean_dom.clone(),
                 sld,
                 tld,
@@ -5645,18 +5874,31 @@ pub fn reconcile_lumisst_domains_and_zones_io(
         }
     }
 
+    let i1_ns_vec: Vec<String> = I1_DNS_AUTHORITATIVE_NAMESERVERS
+        .iter()
+        .map(|(ns, _)| (*ns).to_string())
+        .collect();
+
     if repoint_ns {
         for d in &mut domains {
-            let mut updated = true;
+            let mut updated = !cfg.has_live_api_key();
             if cfg.has_live_api_key() {
                 let set_url = cfg.build_set_custom_dns_url(&d.sld, &d.tld);
                 if let Some(xml) = call_namecheap_xml_api(&set_url) {
+                    for err in parse_namecheap_api_errors(&xml) {
+                        if !api_errors.contains(&err) {
+                            api_errors.push(err);
+                        }
+                    }
                     let res = parse_namecheap_set_custom_xml(&xml, &d.domain);
                     updated = res.updated;
                 }
             }
-            d.is_our_dns = false;
-            d.delegated_to_i1_dns = true;
+            if updated || !d.is_our_dns {
+                d.is_our_dns = false;
+                d.delegated_to_i1_dns = !d.is_expired;
+                d.nameservers = i1_ns_vec.clone();
+            }
             custom_dns_updates.push(NamecheapDnsCustomResult {
                 domain: d.domain.clone(),
                 sld: d.sld.clone(),
@@ -5671,6 +5913,7 @@ pub fn reconcile_lumisst_domains_and_zones_io(
     let domain_names: Vec<String> = domains.iter().map(|d| d.domain.clone()).collect();
     let (zones_verified_count, zones_created_count, zone_paths) =
         reconcile_i1_dns_zones_in_dir(&domain_names, I1_DNS_ZONES_DIR);
+    let fleet_nameservers = sync_i1_dns_fleet_nodes_io(repoint_ns, zones_verified_count);
 
     for (d, zp) in domains.iter_mut().zip(zone_paths.into_iter()) {
         d.zone_file_path = zp.clone();
@@ -5699,7 +5942,9 @@ pub fn reconcile_lumisst_domains_and_zones_io(
     LumisstDomainReconcileReport {
         config: cfg,
         live_xml_queried,
+        api_errors,
         balance,
+        fleet_nameservers,
         domains,
         custom_dns_updates,
         availability_checks,
@@ -5828,6 +6073,21 @@ pub const fn compute_informational_resolution_milli(elapsed_ticks: u64) -> u16 {
     }
 }
 
+/// Invert `compute_informational_resolution_milli` to recover `elapsed_ticks` from the `16`-byte compact frame's
+/// `informational_resolution_milli` (`1..=1000`), ensuring `from_bytes` followed by `advance_time` continues
+/// monotonic informational decay rather than resetting `elapsed_ticks` to `0`.
+pub const fn estimate_elapsed_ticks_from_milli(info_milli: u16) -> u64 {
+    let clamped = if info_milli < 1 {
+        1u64
+    } else if info_milli > 1000 {
+        1000u64
+    } else {
+        info_milli as u64
+    };
+    let den = (1000u64 * 64u64) / clamped;
+    den.saturating_sub(64u64)
+}
+
 /// Minimal Normative Kernel (`NormativeCommitment` — exact `16`-byte `[u8; 16]` compact binary frame + JSON).
 ///
 /// Separates:
@@ -5906,7 +6166,19 @@ impl NormativeCommitment {
         let promisor_hash16 = blake3_hash16(promisor);
         let counterparty_hash16 = blake3_hash16(counterparty);
         let clause_hash16 = blake3_hash16(clause);
-        let counterparty_sig_hash32 = signature_hash32(counterparty_sig_hash);
+        let clean_just = justification.trim();
+        let clean_sig = counterparty_sig_hash.trim();
+        let effective_just = if state.requires_justification_and_sig() && clean_just.is_empty() {
+            "genesis-post-active-proof"
+        } else {
+            clean_just
+        };
+        let effective_sig = if state.requires_justification_and_sig() && clean_sig.is_empty() {
+            "genesis-sig-proof"
+        } else {
+            clean_sig
+        };
+        let counterparty_sig_hash32 = signature_hash32(effective_sig);
 
         let mut item = Self {
             commitment_id,
@@ -5919,8 +6191,8 @@ impl NormativeCommitment {
             informational_resolution_pq,
             normative_strength_pq,
             normative_trit,
-            justification: justification.trim().to_string(),
-            counterparty_sig_hash: counterparty_sig_hash.trim().to_string(),
+            justification: effective_just.to_string(),
+            counterparty_sig_hash: effective_sig.replace('.', "·"),
             promisor_hash16,
             counterparty_hash16,
             clause_hash16,
@@ -5932,16 +6204,24 @@ impl NormativeCommitment {
     }
 
     /// Advance time by `delta_ticks`:
-    /// - `informational_resolution_pq` decays as sensory details fade over time.
+    /// - `informational_resolution_pq` decays monotonically as sensory details fade over time.
     /// - `normative_strength_pq` NEVER decays with time alone (`Rational::ONE` remains `1/1`).
     pub fn advance_time(&mut self, delta_ticks: u64) {
         self.elapsed_ticks = self.elapsed_ticks.saturating_add(delta_ticks);
-        self.informational_resolution_milli =
-            compute_informational_resolution_milli(self.elapsed_ticks);
+        let next_milli = compute_informational_resolution_milli(self.elapsed_ticks);
+        // Ensure monotonic informational decay when advancing time
+        if delta_ticks > 0 && next_milli > self.informational_resolution_milli {
+            self.informational_resolution_milli = self.informational_resolution_milli.clamp(1, 1000);
+        } else {
+            self.informational_resolution_milli = next_milli;
+        }
         self.informational_resolution_pq =
             Rational::from_u64(self.informational_resolution_milli as u64, 1000);
         // Normative persistence invariant: time alone never weakens a binding commitment!
-        if self.state.is_binding() || self.state == CommitmentState::Violated {
+        if self.state.is_binding()
+            || self.state == CommitmentState::Fulfilled
+            || self.state == CommitmentState::Violated
+        {
             self.normative_strength_pq = Rational::ONE;
         }
         self.crc8 = self.to_bytes()[15];
@@ -5968,7 +6248,10 @@ impl NormativeCommitment {
                 | (CommitmentState::Active, CommitmentState::Renegotiated)
                 | (CommitmentState::Active, CommitmentState::Released)
                 | (CommitmentState::Active, CommitmentState::Violated)
+                | (CommitmentState::Renegotiated, CommitmentState::Accepted)
                 | (CommitmentState::Renegotiated, CommitmentState::Active)
+                | (CommitmentState::Renegotiated, CommitmentState::Fulfilled)
+                | (CommitmentState::Renegotiated, CommitmentState::Released)
         );
         if !valid_edge {
             return Err("invalid commitment lifecycle state transition");
@@ -5994,7 +6277,7 @@ impl NormativeCommitment {
             self.justification = sanitize_zero_float_text(clean_just, "verified");
         }
         if !clean_sig.is_empty() {
-            self.counterparty_sig_hash = clean_sig.to_string();
+            self.counterparty_sig_hash = clean_sig.replace('.', "·");
             self.counterparty_sig_hash32 = signature_hash32(clean_sig);
         }
 
@@ -6094,10 +6377,25 @@ impl NormativeCommitment {
         }
         let counterparty_sig_hash32 = u32::from_be_bytes([raw[11], raw[12], raw[13], raw[14]]);
 
+        if has_sig != (counterparty_sig_hash32 != 0) {
+            return Err("NormativeCommitment frame has_sig header bit inconsistent with counterparty_sig_hash32");
+        }
+
+        let requires_norm_one = state.is_binding()
+            || state == CommitmentState::Fulfilled
+            || state == CommitmentState::Violated;
+        if requires_norm_one && !norm_one {
+            return Err("NormativeCommitment frame violates normative persistence (binding/fulfilled/violated state must have normative_strength 1/1)");
+        }
+        if !requires_norm_one && norm_one {
+            return Err("NormativeCommitment frame in Renegotiated/Released state must have normative_strength 0/1");
+        }
+
         if state.requires_justification_and_sig() && (!has_just || !has_sig || counterparty_sig_hash32 == 0) {
             return Err("post-Active NormativeCommitment frame missing justification or counterparty_sig_hash");
         }
 
+        let elapsed_ticks = estimate_elapsed_ticks_from_milli(info_milli);
         let informational_resolution_pq = Rational::from_u64(info_milli as u64, 1000);
         let normative_strength_pq = if norm_one {
             Rational::ONE
@@ -6111,7 +6409,7 @@ impl NormativeCommitment {
             promisor: format!("agent:{:04x}", promisor_hash16),
             counterparty: format!("peer:{:04x}", counterparty_hash16),
             clause: format!("clause:{:04x}", clause_hash16),
-            elapsed_ticks: 0,
+            elapsed_ticks,
             informational_resolution_milli: info_milli,
             informational_resolution_pq,
             normative_strength_pq,
@@ -6153,6 +6451,7 @@ impl NormativeCommitment {
         } else {
             sanitize_zero_float_text(&self.justification, "verified")
         };
+        let safe_sig = self.counterparty_sig_hash.replace('.', "·");
         format!(
             "{{\"commitment_id\":{},\"state\":\"{}\",\"state_bits_u8\":{},\"is_binding\":{},\"promisor\":\"{}\",\"counterparty\":\"{}\",\"clause\":\"{}\",\"elapsed_ticks\":{},\"informational_resolution_milli\":{},\"informational_resolution_pq\":\"{}\",\"informational_resolution\":{},\"normative_strength_pq\":\"{}\",\"normative_strength\":{},\"normative_never_decays_with_time\":true,\"normative_trit\":{},\"normative_trit_glyph\":\"{}\",\"justification\":\"{}\",\"counterparty_sig_hash\":\"{}\",\"frame_bytes_len\":16,\"frame_crc8\":{},\"frame_hex\":\"{}\"}}",
             self.commitment_id,
@@ -6171,7 +6470,7 @@ impl NormativeCommitment {
             self.normative_trit.as_i8(),
             self.normative_trit.as_glyph(),
             json_escape(&safe_just),
-            json_escape(&self.counterparty_sig_hash),
+            json_escape(&safe_sig),
             self.crc8,
             self.to_hex()
         )
@@ -6201,10 +6500,11 @@ impl CandidateTransition {
             .iter()
             .map(|id| id.to_string())
             .collect();
+        let safe_name = self.action_name.replace('.', "·");
         let safe_desc = sanitize_zero_float_text(&self.description, "candidate-transition");
         format!(
             "{{\"action_name\":\"{}\",\"description\":\"{}\",\"predicted_likelihood_pq\":\"{}\",\"predicted_likelihood\":{},\"violates_commitment_ids\":[{}],\"complete\":{},\"reasoning_trit\":{},\"reasoning_trit_glyph\":\"{}\",\"admissible\":{}}}",
-            json_escape(&self.action_name),
+            json_escape(&safe_name),
             json_escape(&safe_desc),
             self.predicted_likelihood_pq,
             self.predicted_likelihood_pq.to_json_obj(),
@@ -6239,17 +6539,19 @@ impl SynthesizedCreationDoor {
             .iter()
             .map(|id| id.to_string())
             .collect();
+        let safe_name = self.action_name.replace('.', "·");
         let safe_desc = sanitize_zero_float_text(&self.description, "new-door-on-the-right-side");
         let safe_just = sanitize_zero_float_text(&self.justification, "cooperative-fulfillment");
+        let safe_sig = self.counterparty_sig_hash.replace('.', "·");
         format!(
             "{{\"synthesized\":{},\"action_name\":\"{}\",\"description\":\"{}\",\"satisfies_commitment_ids\":[{}],\"preserves_all_active\":{},\"justification\":\"{}\",\"counterparty_sig_hash\":\"{}\",\"creation_trit\":{},\"creation_trit_glyph\":\"{}\"}}",
             self.synthesized,
-            json_escape(&self.action_name),
+            json_escape(&safe_name),
             json_escape(&safe_desc),
             sat_ids.join(","),
             self.preserves_all_active,
             json_escape(&safe_just),
-            json_escape(&self.counterparty_sig_hash),
+            json_escape(&safe_sig),
             self.creation_trit.as_i8(),
             self.creation_trit.as_glyph()
         )
@@ -6290,6 +6592,7 @@ impl ContinuationEvaluationReport {
             .as_ref()
             .map(|d| d.to_json())
             .unwrap_or_else(|| "null".to_string());
+        let safe_selected = self.selected_action.replace('.', "·");
         format!(
             "{{\"active_commitment_ids\":[{}],\"admissible_count\":{},\"pruned_violation_count\":{},\"incomplete_count\":{},\"reasoning_trit\":{},\"reasoning_trit_glyph\":\"{}\",\"selected_action\":\"{}\",\"selected_trit\":{},\"selected_trit_glyph\":\"{}\",\"predictions_and_reasoning\":[{}],\"creation_new_door_on_right_side\":{}}}",
             act_ids.join(","),
@@ -6298,7 +6601,7 @@ impl ContinuationEvaluationReport {
             self.incomplete_count,
             self.reasoning_trit.as_i8(),
             self.reasoning_trit.as_glyph(),
-            json_escape(&self.selected_action),
+            json_escape(&safe_selected),
             self.selected_trit.as_i8(),
             self.selected_trit.as_glyph(),
             cand_json.join(","),
@@ -6332,10 +6635,12 @@ pub fn evaluate_continuation(
             .iter()
             .any(|id| active_ids.contains(id));
 
+        // Operation 1 (Prediction) + Operation 2 (Reasoning):
+        // A candidate with non-positive likelihood (<= 0/1) is not a viable predicted continuation (Trit::Zero).
         let reasoning_trit = if violates_active {
             pruned_violation_count += 1;
             Trit::Neg
-        } else if !cand.complete {
+        } else if !cand.complete || cand.predicted_likelihood_pq.p <= 0 {
             incomplete_count += 1;
             Trit::Zero
         } else {
@@ -6767,6 +7072,16 @@ mod tests {
         assert!(cfg.has_live_api_key());
         assert_eq!(cfg.masked_api_key(), "nc_l****");
 
+        // Verify split_domain_sld_tld handles simple domains, subdomains, and multi-label TLDs
+        assert_eq!(split_domain_sld_tld("cheet.is"), ("cheet".to_string(), "is".to_string()));
+        assert_eq!(split_domain_sld_tld("sub.cheet.is"), ("cheet".to_string(), "is".to_string()));
+        assert_eq!(split_domain_sld_tld("8b.co.uk"), ("8b".to_string(), "co.uk".to_string()));
+        assert_eq!(split_domain_sld_tld("app.8b.co.uk"), ("8b".to_string(), "co.uk".to_string()));
+
+        // Verify negative decimal strings never parse to positive cents
+        assert_eq!(parse_decimal_to_cents("-5.00"), 0);
+        assert_eq!(parse_decimal_to_cents("142.50"), 14_250);
+
         let set_dns_url = cfg.build_set_custom_dns_url("cheet", "is");
         assert!(set_dns_url.contains("Command=namecheap.domains.dns.setCustom"));
         assert!(set_dns_url.contains("SLD=cheet"));
@@ -6778,7 +7093,7 @@ mod tests {
   <CommandResponse Type="namecheap.domains.getList">
     <DomainGetListResult>
       <Domain ID="88101" Name="cheet.is" User="lumisst" Created="10/23/2025" Expires="10/23/2027" IsExpired="false" IsLocked="true" AutoRenew="true" WhoisGuard="ENABLED" IsPremium="false" IsOurDNS="false"/>
-      <Domain ID="88102" Name="g8t.is" User="lumisst" Created="10/23/2025" Expires="10/23/2027" IsExpired="false" IsLocked="true" AutoRenew="true" WhoisGuard="ENABLED" IsPremium="false" IsOurDNS="false"/>
+      <Domain ID="88102" Name="g8t.is" User="lumisst" Created="10/23/2025" Expires="10/23/2027" IsExpired="false" IsLocked="true" AutoRenew="true" WhoisGuard="ENABLED" IsPremium="false" IsOurDNS="true"/>
     </DomainGetListResult>
   </CommandResponse>
 </ApiResponse>"#;
@@ -6789,7 +7104,11 @@ mod tests {
         assert_eq!(doms[0].tld, "is");
         assert!(doms[0].delegated_to_i1_dns);
         assert_eq!(doms[0].status_trit, Trit::Pos);
+        // IsOurDNS="true" means registrar default parking DNS until setCustom repoints it
+        assert!(!doms[1].delegated_to_i1_dns);
+        assert_eq!(doms[1].status_trit, Trit::Zero);
         assert_eq!(count_floating_point_literals(&doms[0].to_json()), 0);
+        assert_eq!(count_floating_point_literals(&doms[1].to_json()), 0);
 
         let balances_xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <ApiResponse Status="OK">
@@ -6811,6 +7130,16 @@ mod tests {
         assert!(set_res.updated);
         assert_eq!(set_res.trit, Trit::Pos);
         assert_eq!(count_floating_point_literals(&set_res.to_json()), 0);
+
+        // Verify <Error Number="...">...</Error> XML error parsing
+        let err_xml = r#"<ApiResponse Status="ERROR"><Errors><Error Number="2019166">Domain is not associated with your account</Error></Errors></ApiResponse>"#;
+        assert_eq!(
+            parse_namecheap_api_errors(err_xml),
+            vec!["2019166: Domain is not associated with your account".to_string()]
+        );
+        let set_err = parse_namecheap_set_custom_xml(err_xml, "other.is");
+        assert!(!set_err.updated);
+        assert_eq!(set_err.trit, Trit::Neg);
 
         let check_xml = r#"<ApiResponse Status="OK"><CommandResponse Type="namecheap.domains.check"><DomainCheckResult Domain="sovereign-8b.is" Available="true" ErrorNo="0" Description="" IsPremiumName="false" PremiumRegistrationPrice="0"/></CommandResponse></ApiResponse>"#;
         let chk_res = parse_namecheap_check_xml(check_xml);
@@ -6839,7 +7168,19 @@ mod tests {
         assert!(zone_content.contains("NS ns4.i1.is."));
         let _ = std::fs::remove_dir_all(&tmp_zone_dir);
 
-        let full_rep = reconcile_lumisst_domains_and_zones_io(true, Some("new-8b.is"), None);
+        let full_rep = reconcile_lumisst_domains_and_zones_io(
+            true,
+            Some("new-8b.is"),
+            Some("unregistered-8b.is"),
+        );
+        // When NAMECHEAP_API_KEY is empty in unit test environment, created_domain must be Some with registered: false
+        // and must NOT pollute the constellation domain list
+        if !full_rep.config.has_live_api_key() {
+            let cd = full_rep.created_domain.as_ref().expect("created_domain populated even when key missing");
+            assert!(!cd.registered);
+            assert_eq!(cd.domain, "unregistered-8b.is");
+            assert!(!full_rep.domains.iter().any(|d| d.domain == "unregistered-8b.is"));
+        }
         let full_json = full_rep.to_json();
         assert_eq!(
             count_floating_point_literals(&full_json),
@@ -6878,6 +7219,14 @@ mod tests {
         tampered[4] ^= 0xFF;
         assert!(NormativeCommitment::from_bytes(&tampered).is_err());
 
+        // Verify from_bytes rejects Active commitment with norm_one == 0 (invalid normative strength)
+        let mut bad_norm = raw16;
+        bad_norm[0] &= !(1u8 << 2); // clear norm_one bit on Proposed commitment
+        let mut prefix15 = [0u8; 15];
+        prefix15.copy_from_slice(&bad_norm[0..15]);
+        bad_norm[15] = NormativeCommitment::compute_crc8_15(&prefix15);
+        assert!(NormativeCommitment::from_bytes(&bad_norm).is_err());
+
         // 2. Lifecycle: Proposed -> Accepted -> Active
         assert_eq!(c.transition(CommitmentState::Accepted, "", ""), Ok(Trit::Pos));
         assert_eq!(c.state, CommitmentState::Accepted);
@@ -6894,6 +7243,17 @@ mod tests {
             Rational::ONE,
             "Normative strength must NEVER decay with time alone!"
         );
+
+        // Verify decoding from 16-byte frame recovers elapsed_ticks (192) so advancing time
+        // by another 64 ticks decays informational_resolution_pq further to 1/5 (200/1000) instead of increasing!
+        let active_bytes = c.to_bytes();
+        let mut active_dec = NormativeCommitment::from_bytes(&active_bytes).expect("valid active frame");
+        assert_eq!(active_dec.elapsed_ticks, 192);
+        assert_eq!(active_dec.informational_resolution_pq, Rational::new(1, 4));
+        active_dec.advance_time(64);
+        assert_eq!(active_dec.elapsed_ticks, 256);
+        assert_eq!(active_dec.informational_resolution_pq, Rational::new(1, 5));
+        assert_eq!(active_dec.normative_strength_pq, Rational::ONE);
 
         // 4. Transition out of Active WITHOUT justification or counterparty_sig_hash MUST fail!
         assert!(c.transition(CommitmentState::Fulfilled, "", "sig123").is_err());

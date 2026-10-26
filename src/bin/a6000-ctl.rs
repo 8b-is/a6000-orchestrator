@@ -49,7 +49,7 @@ fn request_remote_https(method: &str, path: &str) -> Option<String> {
         .ok()?;
     if out.status.success() {
         let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if body.starts_with('{') && body.contains("\"ok\":true") {
+        if body.starts_with('{') && body.contains("\"float_count\":0") {
             return Some(body);
         }
     }
@@ -95,6 +95,25 @@ fn sanitize_arg(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect()
+}
+
+fn sanitize_domain_csv(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.' || *c == ',')
+        .collect()
+}
+
+fn url_encode_param(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "%{:02X}", b);
+        }
+    }
+    out
 }
 
 fn print_usage() {
@@ -166,10 +185,18 @@ fn main() {
             if sub == "reconcile" {
                 ("POST", "/api/a6000/domains/reconcile".to_string())
             } else if sub == "check" {
-                let d = args.get(3).map(|s| sanitize_arg(s)).unwrap_or_else(|| "sovereign-8b.is".to_string());
+                let d = args
+                    .get(3)
+                    .map(|s| sanitize_domain_csv(s))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "sovereign-8b.is".to_string());
                 ("GET", format!("/api/a6000/domains?check={}", d))
             } else if sub == "create" {
-                let d = args.get(3).map(|s| sanitize_arg(s)).unwrap_or_else(|| "sovereign-8b.is".to_string());
+                let d = args
+                    .get(3)
+                    .map(|s| sanitize_arg(s))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "sovereign-8b.is".to_string());
                 ("POST", format!("/api/a6000/domains/reconcile?create={}", d))
             } else {
                 ("GET", "/api/a6000/domains".to_string())
@@ -178,10 +205,10 @@ fn main() {
         "domains-reconcile" => ("POST", "/api/a6000/domains/reconcile".to_string()),
         "commitments" => ("GET", "/api/a6000/commitments".to_string()),
         "commitment-transition" | "transition" => {
-            let id = args.get(2).map(|s| sanitize_arg(s)).unwrap_or_default();
-            let st = args.get(3).map(|s| sanitize_arg(s)).unwrap_or_default();
-            let just = args.get(4).map(|s| sanitize_arg(s)).unwrap_or_default();
-            let sig = args.get(5).map(|s| sanitize_arg(s)).unwrap_or_default();
+            let id = args.get(2).map(|s| url_encode_param(s)).unwrap_or_default();
+            let st = args.get(3).map(|s| url_encode_param(s)).unwrap_or_default();
+            let just = args.get(4).map(|s| url_encode_param(s)).unwrap_or_default();
+            let sig = args.get(5).map(|s| url_encode_param(s)).unwrap_or_default();
             if !id.is_empty() && !st.is_empty() {
                 (
                     "POST",
