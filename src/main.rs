@@ -2452,6 +2452,24 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
                 render_backup_verify_json(&rep),
             )
         }
+        (_, "/a6000/api/wici")
+        | (_, "/api/a6000/wici")
+        | (_, "/api/wici")
+        | (_, "/a6000/api/wici/moe") => {
+            let rep = orchestrate_wici_wireless_moe();
+            let json = rep.to_json();
+            {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.c64_page.write_record(&format!(
+                    "WICI_MOE:CLIENTS={}:A6000_ZERO_DISK={}:QAT_REUSE={}:ATTEST={}",
+                    rep.wireless_clients.len(),
+                    rep.hetzner_a6000_plan.zero_disk_experts_pq,
+                    rep.local_rtx4090_tforce_plan.qat_subwindow_reuse_pq,
+                    &rep.attestation_hash[..16.min(rep.attestation_hash.len())]
+                ));
+            }
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
         _ => (
             "HTTP/1.1 404 Not Found",
             "application/json; charset=utf-8",
@@ -2606,6 +2624,11 @@ fn main() {
         }
         "commitments" => {
             println!("{}", render_commitments_json(&init_state, false));
+            return;
+        }
+        "wici" | "wici-moe" => {
+            let rep = orchestrate_wici_wireless_moe();
+            println!("{}", rep.to_json());
             return;
         }
         "commitment-transition" => {
@@ -2785,6 +2808,14 @@ mod tests {
             count_floating_point_literals(html),
             0,
             "Float literal found in Command Deck HTML"
+        );
+
+        let wici_json = orchestrate_wici_wireless_moe().to_json();
+        assert_eq!(
+            count_floating_point_literals(&wici_json),
+            0,
+            "Float literal found in wici_json: {}",
+            wici_json
         );
     }
 }

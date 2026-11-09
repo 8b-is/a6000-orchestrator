@@ -136,6 +136,7 @@ fn print_usage() {
     println!("  domains [reconcile] Subsystem H: Namecheap (lumisst) Registrar & ns1..ns4·i1·is (i1-dns) Zone Reconciler");
     println!("  commitments         Subsystem I: Inspect MEM|8 16-Byte Normative Commitments & 3-Op Continuation Guard");
     println!("  commitment-transition [id] [state] [justification] [sig]  Subsystem I: Transition MEM|8 Commitment");
+    println!("  wici                Subsystem J: WiCi Wireless GPU & DeepSeek-671B MoE 3-Tier Orchestration (A6000 + RTX 4090)");
 }
 
 fn main() {
@@ -204,6 +205,7 @@ fn main() {
         }
         "domains-reconcile" => ("POST", "/api/a6000/domains/reconcile".to_string()),
         "commitments" => ("GET", "/api/a6000/commitments".to_string()),
+        "wici" | "wici-moe" => ("GET", "/a6000/api/wici".to_string()),
         "commitment-transition" | "transition" => {
             let id = args.get(2).map(|s| url_encode_param(s)).unwrap_or_default();
             let st = args.get(3).map(|s| url_encode_param(s)).unwrap_or_default();
