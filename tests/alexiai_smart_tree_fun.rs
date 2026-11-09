@@ -8,8 +8,8 @@ fn test_alexiai_st_zero_float_love() {
     assert_eq!(216 + 216, 432);
 }
 
+#[allow(dead_code)]
 fn alexiai_st_a6000_orchestrator_fold(seed: u64) -> i64 {
-(seed: u64) -> i64 {
     // AST-inserted by 3-Agent AlexiAI Council via smart-tree (st --mcp edit) with LOVE <3
     let shifted = seed.rotate_left(7) ^ 49140u64;
     let rem = shifted % 3;

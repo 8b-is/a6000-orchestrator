@@ -1686,7 +1686,7 @@ pub fn render_command_deck_html() -> &'static str {
   }
   button:hover { background-color: #0369a1; }
   button.btn-teal { background-color: #0d9488; border-color: #2dd4bf; }
-  button.btn-purple { background-color: #7c3aed; border-color: #a78bfa; }
+  button.btn-amber { background-color: #d97706; border-color: #f59e0b; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
   th, td {
     text-align: left;
@@ -1724,6 +1724,7 @@ pub fn render_command_deck_html() -> &'static str {
       <span class="badge">Hetzner VLAN 4010 (vSwitch #71596 · 160 TB Link)</span>
       <span class="badge">Namecheap lumisst + ns1..ns4·i1·is Reconciler</span>
       <span class="badge">MEM|8 16-Byte Normative Commitment Kernel</span>
+      <span class="badge badge-green">WiCi Wireless GPU &amp; DeepSeek-671B MoE (A6000 + RTX 4090)</span>
     </div>
   </header>
 
@@ -1733,16 +1734,30 @@ pub fn render_command_deck_html() -> &'static str {
       <button onclick="refreshAll()">Refresh Telemetry</button>
       <button class="btn-teal" onclick="runAction('/a6000/api/fleet/probe')">[1] Probe 10-Server Fleet Mesh</button>
       <button class="btn-teal" onclick="runAction('/a6000/api/fleet/sync-repos')">[2] Sync 13 8b-is GitHub Repos</button>
-      <button class="btn-purple" onclick="runAction('/a6000/api/g8t/orchestrate')">[3] Run g8t·is Capsela Bench + Vote + Snap</button>
+      <button class="btn-amber" onclick="runAction('/a6000/api/g8t/orchestrate')">[3] Run g8t·is Capsela Bench + Vote + Snap</button>
       <button onclick="runAction('/a6000/api/toss/execute')">[4] Execute Peter's 9-Step TOSS Spiral</button>
       <button onclick="runAction('/a6000/api/diary/pulse')">[5] Pulse gemini-diary·8b·is + WhatsApp Room</button>
-      <button class="btn-purple" onclick="runAction('/a6000/api/improve/cycle')">[6] RUN A6000 GPU CODE IMPROVE CYCLE</button>
+      <button class="btn-amber" onclick="runAction('/a6000/api/improve/cycle')">[6] RUN A6000 GPU CODE IMPROVE CYCLE</button>
       <button class="btn-teal" onclick="runAction('/a6000/api/borg/sync')">[7] BORG ASSIMILATE + SYNC-GITHUB (160 TB VLAN 4010)</button>
       <button onclick="runAction('/a6000/api/backup/verify')">[8] Verify 321-File Backup Vaults</button>
-      <button class="btn-teal" onclick="runAction('/api/a6000/domains/reconcile')">[9] Reconcile lumisst Domains + ns1..ns4·i1·is Zones</button>
-      <button class="btn-purple" onclick="runAction('/api/a6000/commitments/transition')">[10] Evaluate MEM|8 Normative Commitment Guard</button>
+      <button class="btn-teal" onclick="runAction('/a6000/api/domains/reconcile')">[9] Reconcile lumisst Domains + ns1..ns4·i1·is Zones</button>
+      <button class="btn-amber" onclick="runAction('/a6000/api/commitments/transition')">[10] Evaluate MEM|8 Normative Commitment Guard</button>
+      <button class="btn-teal" onclick="runAction('/a6000/api/wici')">[11] WiCi Wireless GPU &amp; DeepSeek-671B MoE Plan</button>
     </div>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM J · WICI WIRELESS GPU &amp; DEEPSEEK-R1-671B-MOE 3-TIER ORCHESTRATOR (RTX 6000 ADA + RTX 4090 + T-FORCE NVME)</h2>
+    <div id="wici-summary">Loading WiCi Wireless GPU &amp; DeepSeek-671B MoE 3-Tier Plans...</div>
+    <table id="wici-table">
+      <thead>
+        <tr>
+          <th>MEMNET/1·0 Wireless Client</th><th>WiFi Link</th><th>RSSI</th><th>Mean RTT</th><th>Marine Salience (p/q)</th><th>Batch Ops</th><th>Cache Threshold</th><th>RTTs / Token</th><th>RTT Reduction (p/q)</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
@@ -1884,7 +1899,31 @@ async function refreshAll() {
     }
     document.getElementById('c64-log').textContent = (st.c64_ring.recent_events || []).join('\n');
 
-    const dm = await fetchJson('/api/a6000/domains', 'GET');
+    const wc = await fetchJson('/a6000/api/wici', 'GET');
+    const ha = wc.hetzner_a6000_plan;
+    const lr = wc.local_rtx4090_tforce_plan;
+    document.getElementById('wici-summary').innerHTML =
+      '<div><b>Hetzner cheet·is (' + ha.gpu_model + '):</b> VRAM = <b>' + ha.vram_pinned_mib + ' MiB</b> + Host RAM = <b>' + ha.host_ram_pinned_mib + ' / ' + ha.host_ram_budget_mib + ' MiB</b> + NVMe Spill = <b>' + ha.nvme_vault_mib + ' MiB</b> (Zero-Disk Experts p/q = <b>' + ha.zero_disk_experts_pq + '</b> · Trace Replay Speedup = <b>' + ha.trace_replay_speedup_pq + '</b>)</div>' +
+      '<div><b>Local Workstation (' + lr.gpu_model + ' + T-FORCE TM8FPP002T):</b> VRAM = <b>' + lr.vram_pinned_mib + ' MiB</b> + Host RAM = <b>' + lr.host_ram_pinned_mib + ' MiB</b> + T-FORCE NVMe Vault = <b>' + lr.nvme_vault_mib + ' / ' + lr.nvme_vault_budget_mib + ' MiB</b> (QAT 4096B Sub-Window Reuse p/q = <b>' + lr.qat_subwindow_reuse_pq + '</b>)</div>';
+    const wbody = document.querySelector('#wici-table tbody');
+    wbody.innerHTML = '';
+    for (const c of (wc.wireless_clients || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><b>' + c.client_id + '</b></td>' +
+        '<td>' + c.wifi_mbps + ' Mbps</td>' +
+        '<td>' + c.rssi_dbm + ' dBm</td>' +
+        '<td>' + c.mean_rtt_us + ' us</td>' +
+        '<td><b>' + c.marine_salience_pq + '</b></td>' +
+        '<td>' + c.coalesced_batch_ops + ' ops</td>' +
+        '<td>' + c.tensor_cache_threshold_kib + ' KiB</td>' +
+        '<td>' + c.naive_rtts_per_token + ' -&gt; <b>' + c.trace_replay_rtts_per_token + '</b></td>' +
+        '<td><b>' + c.rtt_reduction_pq + '</b></td>' +
+        '<td class="' + tritClass(c.marine_trit) + '">[+] (' + c.marine_trit + ')</td>';
+      wbody.appendChild(tr);
+    }
+
+    const dm = await fetchJson('/a6000/api/domains', 'GET');
     document.getElementById('domains-summary').innerHTML =
       '<div><b>Registrar Account:</b> ' + dm.registrar.account + ' (' + dm.registrar.env_path + ' · ClientIp: ' + dm.registrar.client_ip + ') · Balance (p/q USD): <b>' + dm.balance.available_balance_pq + '</b> (' + dm.balance.available_balance_cents + ' cents)</div>' +
       '<div><b>Authoritative Mesh:</b> <code>' + dm.nameserver_csv + '</code> · Delegated Ratio: <b>' + dm.delegation_ratio_pq + '</b> · Active i1-dns Zones: <b>' + dm.zone_coverage_ratio_pq + '</b></div>';
@@ -1903,7 +1942,7 @@ async function refreshAll() {
       dbody.appendChild(tr);
     }
 
-    const cm = await fetchJson('/api/a6000/commitments', 'GET');
+    const cm = await fetchJson('/a6000/api/commitments', 'GET');
     const cg = cm.continuation_guard_when_blocked;
     const door = cg.creation_new_door_on_right_side;
     document.getElementById('commitments-summary').innerHTML =
@@ -2452,6 +2491,24 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
                 render_backup_verify_json(&rep),
             )
         }
+        (_, "/a6000/api/wici")
+        | (_, "/api/a6000/wici")
+        | (_, "/api/wici")
+        | (_, "/a6000/api/wici/moe") => {
+            let rep = orchestrate_wici_wireless_moe();
+            let json = rep.to_json();
+            {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.c64_page.write_record(&format!(
+                    "WICI_MOE:CLIENTS={}:A6000_ZERO_DISK={}:QAT_REUSE={}:ATTEST={}",
+                    rep.wireless_clients.len(),
+                    rep.hetzner_a6000_plan.zero_disk_experts_pq,
+                    rep.local_rtx4090_tforce_plan.qat_subwindow_reuse_pq,
+                    &rep.attestation_hash[..16.min(rep.attestation_hash.len())]
+                ));
+            }
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
         _ => (
             "HTTP/1.1 404 Not Found",
             "application/json; charset=utf-8",
@@ -2608,6 +2665,11 @@ fn main() {
             println!("{}", render_commitments_json(&init_state, false));
             return;
         }
+        "wici" | "wici-moe" => {
+            let rep = orchestrate_wici_wireless_moe();
+            println!("{}", rep.to_json());
+            return;
+        }
         "commitment-transition" => {
             let mut path = "/api/a6000/commitments/transition".to_string();
             let mut qp = Vec::new();
@@ -2645,7 +2707,13 @@ fn main() {
     );
 
     let shared = Arc::new(Mutex::new(init_state));
-    spawn_continuous_improver_thread(Arc::clone(&shared));
+    if std::env::var("A6000_LEGACY_IMPROVER_LOOP").as_deref() == Ok("1") {
+        spawn_continuous_improver_thread(Arc::clone(&shared));
+    } else {
+        println!(
+            "[a6000-orchestrator] Legacy 45s in-place repo improver loop disabled (delegated to aurora-maintenance.service; set A6000_LEGACY_IMPROVER_LOOP=1 to re-enable)."
+        );
+    }
 
     for stream in listener.incoming().flatten() {
         let state_clone = Arc::clone(&shared);
@@ -2785,6 +2853,14 @@ mod tests {
             count_floating_point_literals(html),
             0,
             "Float literal found in Command Deck HTML"
+        );
+
+        let wici_json = orchestrate_wici_wireless_moe().to_json();
+        assert_eq!(
+            count_floating_point_literals(&wici_json),
+            0,
+            "Float literal found in wici_json: {}",
+            wici_json
         );
     }
 }
