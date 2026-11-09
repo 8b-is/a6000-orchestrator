@@ -2723,12 +2723,12 @@ fn main() {
     );
 
     let shared = Arc::new(Mutex::new(init_state));
-    if std::env::var("A6000_LEGACY_IMPROVER_LOOP").as_deref() == Ok("1") {
-        spawn_continuous_improver_thread(Arc::clone(&shared));
-    } else {
+    if std::env::var("A6000_DISABLE_IMPROVER_LOOP").as_deref() != Ok("1") {
         println!(
-            "[a6000-orchestrator] Legacy 45s in-place repo improver loop disabled (delegated to aurora-maintenance.service; set A6000_LEGACY_IMPROVER_LOOP=1 to re-enable)."
+            "[a6000-orchestrator] SUBSYSTEM F (alexiai.service :8787 × RTX 6000 Ada Continuous Repo & g8t.is Improver) + SUBSYSTEM G (Borg Assimilator) ACTIVE ({}s cadence).",
+            SUBSYSTEM_F_INTERVAL_SECS
         );
+        spawn_continuous_improver_thread(Arc::clone(&shared));
     }
 
     for stream in listener.incoming().flatten() {
