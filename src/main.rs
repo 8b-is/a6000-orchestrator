@@ -795,12 +795,28 @@ fn compute_backup_verification_report() -> BackupVerificationReport {
 }
 
 fn verify_single_backup_node(node_ip: &'static str, check_local_first: bool) -> BackupVaultNodeCheck {
-    let vault_path = "/data/8b-is/backups";
-    let archive_file = "/data/8b-is/backups/8b-is-local-state-backup-20261025.tar.zst";
-    let sha_file = "/data/8b-is/backups/8b-is-local-state-backup-20261025.tar.zst.sha256";
-    let sums_file = "/data/8b-is/backups/SHA256SUMS.txt";
+    let vault_path = if node_ip == "188.40.209.186" && std::path::Path::new("/mnt/raid160/backups").exists() {
+        "/mnt/raid160/backups"
+    } else {
+        "/data/8b-is/backups"
+    };
+    let archive_file = if vault_path == "/mnt/raid160/backups" {
+        "/mnt/raid160/backups/8b-is-local-state-backup-20261025.tar.zst"
+    } else {
+        "/data/8b-is/backups/8b-is-local-state-backup-20261025.tar.zst"
+    };
+    let sha_file = if vault_path == "/mnt/raid160/backups" {
+        "/mnt/raid160/backups/8b-is-local-state-backup-20261025.tar.zst.sha256"
+    } else {
+        "/data/8b-is/backups/8b-is-local-state-backup-20261025.tar.zst.sha256"
+    };
+    let sums_file = if vault_path == "/mnt/raid160/backups" {
+        "/mnt/raid160/backups/SHA256SUMS.txt"
+    } else {
+        "/data/8b-is/backups/SHA256SUMS.txt"
+    };
 
-    if check_local_first && std::path::Path::new(archive_file).exists() {
+    if (check_local_first || vault_path == "/mnt/raid160/backups") && std::path::Path::new(archive_file).exists() {
         let bytes = std::fs::metadata(archive_file)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -2707,12 +2723,12 @@ fn main() {
     );
 
     let shared = Arc::new(Mutex::new(init_state));
-    if std::env::var("A6000_LEGACY_IMPROVER_LOOP").as_deref() == Ok("1") {
-        spawn_continuous_improver_thread(Arc::clone(&shared));
-    } else {
+    if std::env::var("A6000_DISABLE_IMPROVER_LOOP").as_deref() != Ok("1") {
         println!(
-            "[a6000-orchestrator] Legacy 45s in-place repo improver loop disabled (delegated to aurora-maintenance.service; set A6000_LEGACY_IMPROVER_LOOP=1 to re-enable)."
+            "[a6000-orchestrator] SUBSYSTEM F (alexiai.service :8787 × RTX 6000 Ada Continuous Repo & g8t.is Improver) + SUBSYSTEM G (Borg Assimilator) ACTIVE ({}s cadence).",
+            SUBSYSTEM_F_INTERVAL_SECS
         );
+        spawn_continuous_improver_thread(Arc::clone(&shared));
     }
 
     for stream in listener.incoming().flatten() {
