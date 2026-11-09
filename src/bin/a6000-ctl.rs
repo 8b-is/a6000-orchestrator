@@ -184,27 +184,27 @@ fn main() {
         "domains" => {
             let sub = args.get(2).map(String::as_str).unwrap_or("");
             if sub == "reconcile" {
-                ("POST", "/api/a6000/domains/reconcile".to_string())
+                ("POST", "/a6000/api/domains/reconcile".to_string())
             } else if sub == "check" {
                 let d = args
                     .get(3)
                     .map(|s| sanitize_domain_csv(s))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "sovereign-8b.is".to_string());
-                ("GET", format!("/api/a6000/domains?check={}", d))
+                ("GET", format!("/a6000/api/domains?check={}", d))
             } else if sub == "create" {
                 let d = args
                     .get(3)
                     .map(|s| sanitize_arg(s))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "sovereign-8b.is".to_string());
-                ("POST", format!("/api/a6000/domains/reconcile?create={}", d))
+                ("POST", format!("/a6000/api/domains/reconcile?create={}", d))
             } else {
-                ("GET", "/api/a6000/domains".to_string())
+                ("GET", "/a6000/api/domains".to_string())
             }
         }
-        "domains-reconcile" => ("POST", "/api/a6000/domains/reconcile".to_string()),
-        "commitments" => ("GET", "/api/a6000/commitments".to_string()),
+        "domains-reconcile" => ("POST", "/a6000/api/domains/reconcile".to_string()),
+        "commitments" => ("GET", "/a6000/api/commitments".to_string()),
         "wici" | "wici-moe" => ("GET", "/a6000/api/wici".to_string()),
         "commitment-transition" | "transition" => {
             let id = args.get(2).map(|s| url_encode_param(s)).unwrap_or_default();
@@ -215,12 +215,12 @@ fn main() {
                 (
                     "POST",
                     format!(
-                        "/api/a6000/commitments/transition?id={}&target_state={}&justification={}&counterparty_sig_hash={}",
+                        "/a6000/api/commitments/transition?id={}&target_state={}&justification={}&counterparty_sig_hash={}",
                         id, st, just, sig
                     ),
                 )
             } else {
-                ("POST", "/api/a6000/commitments/transition".to_string())
+                ("POST", "/a6000/api/commitments/transition".to_string())
             }
         }
         "-h" | "--help" | "help" => {
