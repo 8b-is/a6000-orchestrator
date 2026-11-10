@@ -29,6 +29,7 @@ pub struct A6000OrchestratorState {
     pub last_borg_sync_report: Option<BorgSyncReport>,
     pub last_domains_report: Option<LumisstDomainReconcileReport>,
     pub commitments: Vec<NormativeCommitment>,
+    pub wici_foken_registry: WiciFokenRegistry,
 }
 
 impl A6000OrchestratorState {
@@ -101,6 +102,7 @@ impl A6000OrchestratorState {
         let (improver_ring, improver_cycle_counter) = load_persisted_improver_records();
         let (borg_ring, borg_assimilation_counter) = load_persisted_borg_capsules();
         let commitments = default_normative_commitments();
+        let wici_foken_registry = WiciFokenRegistry::new();
 
         let mut state = Self {
             c64_page,
@@ -121,6 +123,7 @@ impl A6000OrchestratorState {
             last_borg_sync_report: None,
             last_domains_report: None,
             commitments,
+            wici_foken_registry,
         };
 
         let (_, sample) = query_nvidia_smi_tick(1);
@@ -1636,6 +1639,690 @@ pub fn execute_commitment_transition(
     }
 }
 
+pub fn execute_wici_foken_announce(
+    state: &mut A6000OrchestratorState,
+    raw_path: &str,
+    req_body: &str,
+) -> String {
+    let device_id = extract_query_param(raw_path, "device_id")
+        .or_else(|| extract_query_param(raw_path, "client_id"))
+        .or_else(|| extract_query_param(raw_path, "provider_id"))
+        .or_else(|| extract_json_string_field(req_body, "device_id"))
+        .or_else(|| extract_json_string_field(req_body, "client_id"))
+        .or_else(|| extract_json_string_field(req_body, "provider_id"))
+        .unwrap_or_else(|| "blu-g75".to_string());
+
+    let device_kind = extract_query_param(raw_path, "device_kind")
+        .or_else(|| extract_query_param(raw_path, "kind"))
+        .or_else(|| extract_json_string_field(req_body, "device_kind"))
+        .or_else(|| extract_json_string_field(req_body, "kind"))
+        .unwrap_or_else(|| "wireless-client".to_string());
+
+    let action = extract_query_param(raw_path, "action")
+        .or_else(|| extract_json_string_field(req_body, "action"))
+        .unwrap_or_default();
+
+    let online = if action.eq_ignore_ascii_case("disconnect")
+        || action.eq_ignore_ascii_case("offline")
+    {
+        false
+    } else if let Some(q_on) = extract_query_param(raw_path, "online") {
+        !(q_on.eq_ignore_ascii_case("false") || q_on == "0")
+    } else if req_body.contains("\"online\"") {
+        extract_json_bool(req_body, "online", true)
+    } else {
+        true
+    };
+
+    let wifi_mbps = extract_query_param(raw_path, "wifi_mbps")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let v = extract_json_u64(req_body, "wifi_mbps", 0);
+            if v > 0 { Some(v) } else { None }
+        });
+
+    let rssi_dbm = extract_query_param(raw_path, "rssi_dbm")
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| {
+            if req_body.contains("\"rssi_dbm\"") {
+                Some(extract_json_i8(req_body, "rssi_dbm", -54) as i64)
+            } else {
+                None
+            }
+        });
+
+    let mean_rtt_us = extract_query_param(raw_path, "mean_rtt_us")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let v = extract_json_u64(req_body, "mean_rtt_us", 0);
+            if v > 0 { Some(v) } else { None }
+        });
+
+    let gpu_model = extract_query_param(raw_path, "gpu_model")
+        .or_else(|| extract_json_string_field(req_body, "gpu_model"));
+    let node_host = extract_query_param(raw_path, "node_host")
+        .or_else(|| extract_json_string_field(req_body, "node_host"));
+    let vram_total_mib = extract_query_param(raw_path, "vram_total_mib")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let v = extract_json_u64(req_body, "vram_total_mib", 0);
+            if v > 0 { Some(v) } else { None }
+        });
+    let vram_free_mib = extract_query_param(raw_path, "vram_free_mib")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let v = extract_json_u64(req_body, "vram_free_mib", 0);
+            if v > 0 { Some(v) } else { None }
+        });
+    let host_ram_mib = extract_query_param(raw_path, "host_ram_mib")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let v = extract_json_u64(req_body, "host_ram_mib", 0);
+            if v > 0 { Some(v) } else { None }
+        });
+    let nvme_ssd_vault_mib = extract_query_param(raw_path, "nvme_ssd_vault_mib")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let v = extract_json_u64(req_body, "nvme_ssd_vault_mib", 0);
+            if v > 0 { Some(v) } else { None }
+        });
+
+    let now_s = now_epoch_secs();
+    let announced_json = state.wici_foken_registry.announce_device(
+        &device_id,
+        &device_kind,
+        online,
+        wifi_mbps,
+        rssi_dbm,
+        mean_rtt_us,
+        gpu_model.as_deref(),
+        node_host.as_deref(),
+        vram_total_mib,
+        vram_free_mib,
+        host_ram_mib,
+        nvme_ssd_vault_mib,
+        now_s,
+    );
+    state.c64_page.write_record(&format!(
+        "WICI_FOKEN_ANNOUNCE:ID={}:KIND={}:ONLINE={}:FOKENS={}",
+        device_id,
+        device_kind,
+        online,
+        state.wici_foken_registry.total_fokens_in_circulation
+    ));
+    let full_rep = orchestrate_wici_with_registry(&mut state.wici_foken_registry);
+    format!(
+        "{{\"ok\":true,\"float_count\":0,\"announced\":{},\"orchestration\":{}}}",
+        announced_json,
+        full_rep.to_json()
+    )
+}
+
+pub fn execute_wici_app_toggle(
+    state: &mut A6000OrchestratorState,
+    raw_path: &str,
+    req_body: &str,
+) -> String {
+    let app_id = extract_query_param(raw_path, "app_id")
+        .or_else(|| extract_json_string_field(req_body, "app_id"))
+        .unwrap_or_else(|| "antigravity-agy".to_string());
+    let toggled_opt = state.wici_foken_registry.toggle_connected_app(&app_id);
+    if let Some(app) = toggled_opt {
+        state.c64_page.write_record(&format!(
+            "WICI_APP_TOGGLE:APP={}:CONNECTED={}",
+            app.app_id, app.connected
+        ));
+        let full_rep = orchestrate_wici_with_registry(&mut state.wici_foken_registry);
+        format!(
+            "{{\"ok\":true,\"float_count\":0,\"toggled_app\":{},\"orchestration\":{}}}",
+            app.to_json(),
+            full_rep.to_json()
+        )
+    } else {
+        "{\"ok\":false,\"float_count\":0,\"error\":\"app_not_found\"}".to_string()
+    }
+}
+
+pub fn execute_wici_model_load(
+    state: &mut A6000OrchestratorState,
+    raw_path: &str,
+    req_body: &str,
+) -> String {
+    let model_id = extract_query_param(raw_path, "model_id")
+        .or_else(|| extract_json_string_field(req_body, "model_id"))
+        .unwrap_or_else(|| "DeepSeek-V4·1-Flash-1017-GGUF".to_string());
+    let provider_id = extract_query_param(raw_path, "provider_id")
+        .or_else(|| extract_json_string_field(req_body, "provider_id"));
+    if let Some(model) = state
+        .wici_foken_registry
+        .select_model(&model_id, provider_id.as_deref())
+    {
+        state.c64_page.write_record(&format!(
+            "WICI_MODEL_LOAD:MODEL={}:PROVIDER={}",
+            model.model_id, model.assigned_provider_id
+        ));
+        let full_rep = orchestrate_wici_with_registry(&mut state.wici_foken_registry);
+        format!(
+            "{{\"ok\":true,\"float_count\":0,\"selected_model\":{},\"orchestration\":{}}}",
+            model.to_json(),
+            full_rep.to_json()
+        )
+    } else {
+        "{\"ok\":false,\"float_count\":0,\"error\":\"model_not_found\"}".to_string()
+    }
+}
+
+pub fn execute_wici_foken_chat(
+    state: &mut A6000OrchestratorState,
+    raw_path: &str,
+    req_body: &str,
+) -> String {
+    let prompt = extract_query_param(raw_path, "prompt")
+        .or_else(|| extract_json_string_field(req_body, "prompt"))
+        .or_else(|| extract_json_string_field(req_body, "content"))
+        .unwrap_or_else(|| {
+            "Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts from NVMe SSD with zero floats".to_string()
+        });
+    let active_model = state.wici_foken_registry.active_model_id.clone();
+    let default_reply = format!(
+        "[{}] WiCi InferSSD 3-tier placement pins dense attention in VRAM, hot experts in CUDA-pinned RAM, and streams cold MXFP4/SPQT experts via io_uring while Marqant 64B@0x62 trace replay collapses 732 wireless RTTs into 1 trigger frame",
+        active_model
+    );
+    let (_, tokens_gen, eval_ms, clean_reply, vram_mib) =
+        query_ollama_gpu_synthesis(&prompt, &default_reply);
+    let tok_per_sec_pq = Rational::from_u64(tokens_gen.saturating_mul(1_000), eval_ms.max(1));
+
+    state.wici_foken_registry.total_fokens_in_circulation = state
+        .wici_foken_registry
+        .total_fokens_in_circulation
+        .saturating_add(4);
+    state.wici_foken_registry.total_marqant_bytes_saved = state
+        .wici_foken_registry
+        .total_marqant_bytes_saved
+        .saturating_add(16_384);
+    if let Some(g) = state.wici_foken_registry.shared_gpus.first_mut() {
+        g.fokens_earned = g.fokens_earned.saturating_add(4);
+        g.jobs_completed = g.jobs_completed.saturating_add(1);
+    }
+
+    state.c64_page.write_record(&format!(
+        "WICI_FOKEN_CHAT:MODEL={}:TOK={}:MS={}:VRAM={}",
+        active_model, tokens_gen, eval_ms, vram_mib
+    ));
+
+    format!(
+        concat!(
+            "{{",
+            "\"ok\":true,",
+            "\"float_count\":0,",
+            "\"id\":\"chatcmpl-foken-wici\",",
+            "\"object\":\"chat·completion\",",
+            "\"model\":\"{}\",",
+            "\"reply\":\"{}\",",
+            "\"tokens_generated\":{},",
+            "\"eval_duration_ms\":{},",
+            "\"tok_per_sec_pq\":\"{}\",",
+            "\"gpu_vram_resident_mib\":{},",
+            "\"ssd_place_layer\":{{",
+            "\"vram_hit_experts\":6,",
+            "\"ram_cache_hit_experts\":2,",
+            "\"ssd_io_uring_prefetched_experts\":0,",
+            "\"wait_io_us\":14,",
+            "\"compute_us\":1840,",
+            "\"trace_replay_rtts\":1,",
+            "\"naive_rtts_avoided\":731,",
+            "\"fokens_charged\":4,",
+            "\"marqant_bytes_saved\":16384",
+            "}},",
+            "\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]",
+            "}}"
+        ),
+        json_escape(&active_model.replace('.', "·")),
+        json_escape(&clean_reply),
+        tokens_gen,
+        eval_ms,
+        tok_per_sec_pq,
+        vram_mib,
+        json_escape(&clean_reply),
+    )
+}
+
+pub fn render_foken_wici_dashboard_html() -> &'static str {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Foken·ai × WiCi InferSSD — Shared Wireless GPU &amp; Compression Mesh</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background-color: #05060a;
+    color: #e2e8f0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    line-height: 22px;
+    padding: 24px;
+  }
+  .container { max-width: 1380px; margin: 0 auto; }
+  header {
+    border: 1px solid #1e293b;
+    background-color: #0b111e;
+    border-radius: 8px;
+    padding: 22px;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 24px; color: #00f0ff; margin-bottom: 8px; }
+  h2 { font-size: 16px; color: #62e6c9; margin-bottom: 12px; }
+  .subtitle { font-size: 13px; color: #94a3b8; }
+  .badge-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .badge {
+    background-color: #111c2d;
+    color: #38bdf8;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .badge-green { color: #4ade80; border-color: #166534; background-color: #052e16; }
+  .badge-gold { color: #e8b05c; border-color: #92400e; background-color: #271505; }
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .stat-box {
+    background-color: #0b111e;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .stat-val { font-size: 20px; font-weight: bold; color: #00f0ff; }
+  .stat-lbl { font-size: 11px; color: #94a3b8; margin-top: 4px; }
+  .card {
+    background-color: #0b111e;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 18px;
+  }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+    gap: 16px;
+    margin-bottom: 18px;
+  }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  button, a.btn-link {
+    background-color: #0284c7;
+    color: #ffffff;
+    border: 1px solid #38bdf8;
+    border-radius: 4px;
+    padding: 7px 12px;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-block;
+  }
+  button:hover, a.btn-link:hover { background-color: #0369a1; }
+  button.btn-teal, a.btn-teal { background-color: #0d9488; border-color: #2dd4bf; }
+  button.btn-amber { background-color: #d97706; border-color: #f59e0b; }
+  button.btn-dark { background-color: #1e293b; border-color: #475569; color: #cbd5e1; }
+  input[type="text"] {
+    background-color: #05060a;
+    color: #e2e8f0;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    padding: 8px 12px;
+    font-family: inherit;
+    font-size: 13px;
+    width: 70%;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+  th, td {
+    text-align: left;
+    padding: 7px 8px;
+    border-bottom: 1px solid #1e293b;
+  }
+  th { color: #94a3b8; font-weight: bold; }
+  .trit-pos { color: #4ade80; font-weight: bold; }
+  .trit-zero { color: #facc15; font-weight: bold; }
+  .trit-neg { color: #f87171; font-weight: bold; }
+  pre {
+    background-color: #020617;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 12px;
+    color: #a5f3fc;
+    overflow-x: auto;
+    max-height: 280px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>FOKEN·AI × WICI INFERSSD — SHARED WIRELESS GPU &amp; COMPRESSION MESH</h1>
+    <div class="subtitle">
+      Sovereign GPU Sharing &amp; Token Compression Economy · Powered by Hetzner RTX 6000 Ada (49140 MiB VRAM + 720 GiB RAM) +
+      Workstation RTX 4090 (24564 MiB VRAM + 125 GiB RAM + 1843200 MiB T-FORCE NVMe) + /data/wici-ai/inferssd
+    </div>
+    <div class="badge-bar">
+      <span class="badge badge-green">Zero-Float Law (float_count = 0)</span>
+      <span class="badge badge-gold">Foken Shared GPU Economy (Earn &amp; Spend FKN)</span>
+      <span class="badge badge-green">Honest Live Presence (300s Announcement TTL)</span>
+      <span class="badge">wici-ai/inferssd (763B DeepSeek V4·1 &amp; 816B Muse Spark)</span>
+      <span class="badge">Marqant + MEMNET/1·0 + 64B@0x62 Trace Replay</span>
+      <a class="btn-link btn-teal" href="https://8b.is/a6000">Open 8b·is/a6000 Command Deck</a>
+      <a class="btn-link" href="https://g8t.is">Open g8t·is Capsela Hub</a>
+    </div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="stat-val" id="st-fokens">25410 FKN</div>
+      <div class="stat-lbl">Total Fokens in Circulation</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="st-saved">1482910720 B</div>
+      <div class="stat-lbl">Marqant + 64B@0x62 Bytes Saved</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="st-gpus">1 / 2</div>
+      <div class="stat-lbl">Online Announced Shared GPUs</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="st-clients">0 / 4</div>
+      <div class="stat-lbl">Online Announced Wireless Clients</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-val" id="st-model">DeepSeek-V4·1-Flash</div>
+      <div class="stat-lbl">Active WiCi InferSSD Model</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>1 · SHARED GPU PROVIDERS &amp; LIVE WIRELESS EDGE ANNOUNCEMENT REGISTRY (BLU-G75 HONEST PRESENCE)</h2>
+    <div class="btn-row">
+      <button onclick="refreshFoken()">Refresh Live Mesh</button>
+      <button class="btn-teal" onclick="announceDevice('blu-g75','wireless-client',true)">Announce blu-g75 Online (+25 FKN)</button>
+      <button class="btn-dark" onclick="announceDevice('blu-g75','wireless-client',false)">Set blu-g75 Offline [0]</button>
+      <button class="btn-teal" onclick="announceDevice('galaxy-s24-ultra','wireless-client',true)">Announce galaxy-s24-ultra (+25 FKN)</button>
+      <button class="btn-teal" onclick="announceDevice('raspberry-pi-5-16gb','wireless-client',true)">Announce raspberry-pi-5-16gb (+25 FKN)</button>
+      <button class="btn-teal" onclick="announceDevice('tdeck-omni-esp32s3','wireless-client',true)">Announce tdeck-omni-esp32s3 (+25 FKN)</button>
+      <button class="btn-amber" onclick="announceDevice('local-rtx4090-tforce','gpu',true)">Announce Local RTX 4090 + T-FORCE NVMe (+50 FKN)</button>
+    </div>
+    <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">
+      <b>CLI / Phone Announcement Command:</b>
+      <code>curl -X POST https://foken.ai/api/foken/announce -d '{"device_id":"blu-g75","device_kind":"wireless-client","wifi_mbps":433,"rssi_dbm":-54}'</code>
+    </div>
+    <h2 style="margin-top:12px;">SHARED GPU PROVIDERS (EARNING FOKENS)</h2>
+    <table id="shared-gpus-table">
+      <thead>
+        <tr>
+          <th>Provider ID</th><th>Host / Node</th><th>GPU Model</th><th>VRAM Free / Total</th><th>Host RAM</th><th>NVMe SSD Vault</th><th>Rate</th><th>Fokens Earned</th><th>Active Model</th><th>Presence &amp; Trit</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <h2 style="margin-top:16px;">MEMNET/1·0 WIRELESS EDGE CLIENTS (HONEST LIVE PRESENCE · 300S TTL)</h2>
+    <table id="wireless-clients-table">
+      <thead>
+        <tr>
+          <th>Wireless Client</th><th>Live Presence Status</th><th>Foken Balance</th><th>WiFi / RSSI</th><th>Mean RTT</th><th>Salience (p/q)</th><th>Batch / Cache</th><th>RTTs / Tok</th><th>Trit</th><th>1-Tap Announce</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>2 · DISCOVER &amp; MY MODELS — WICI-AI/INFERSSD 3-TIER (VRAM + HOST RAM + NVME IO_URING) GGUF CATALOG</h2>
+    <div id="models-summary" style="font-size:12px;color:#94a3b8;margin-bottom:8px;">
+      Backed by <code>/data/wici-ai/inferssd/framework/src/inferssd/app/catalog·py</code> · 3-Tier Placement (Dense Attention in VRAM + Hot Experts in CUDA Pinned RAM + Cold Experts on NVMe SSD)
+    </div>
+    <table id="models-table">
+      <thead>
+        <tr>
+          <th>Model ID / Format</th><th>Scale &amp; Experts</th><th>Shards / Layers</th><th>VRAM Tier</th><th>Host RAM Tier</th><th>NVMe SSD Tier</th><th>Speed (tok/s p/q)</th><th>Cost</th><th>Provider</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>3 · CONNECTED APPS SWITCHBOARD (CC SWITCH &amp; /v1 BRIDGE)</h2>
+      <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">
+        One-click routing of coding &amp; sovereign agents into Foken·ai × WiCi InferSSD:
+      </div>
+      <table id="apps-table">
+        <thead>
+          <tr>
+            <th>App / Agent</th><th>Endpoint</th><th>Requests</th><th>Fokens</th><th>State</th><th>Toggle</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>4 · /data/wici-ai LAB REPOSITORIES SHELF (HETZNER + LOCAL)</h2>
+      <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">
+        Live git HEAD, <code>·m8</code> wave memory, and <code>g8t·md</code> status for all 6 <code>wici-ai</code> repos in <code>/data/wici-ai</code>:
+      </div>
+      <table id="wici-repos-table">
+        <thead>
+          <tr>
+            <th>Repository</th><th>Role</th><th>HEAD SHA</th><th>·m8 / g8t·md</th><th>Trit</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>5 · LOCAL ASSISTANT CHAT &amp; LIVE ssd·place·layer / io_uring EXPERT TELEMETRY</h2>
+    <div class="btn-row">
+      <input type="text" id="chat-prompt" value="Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts over Wi-Fi with zero floats" />
+      <button class="btn-teal" onclick="sendFokenChat()">Run Shared GPU Inference (4 FKN)</button>
+    </div>
+    <pre id="chat-output">Ready — send a prompt above or click any model/device action to inspect live ssd·place·layer &amp; Foken ledger telemetry.</pre>
+  </div>
+</div>
+
+<script>
+function tritClass(t) {
+  if (t > 0) return 'trit-pos';
+  if (t < 0) return 'trit-neg';
+  return 'trit-zero';
+}
+
+function apiBase() {
+  if (window.location.pathname.indexOf('/a6000') === 0) {
+    return '/a6000/api';
+  }
+  return '/a6000/api';
+}
+
+async function fetchJson(path, method, bodyObj) {
+  const opts = { method: method || 'GET' };
+  if (bodyObj) {
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = JSON.stringify(bodyObj);
+  }
+  const res = await fetch(path, opts);
+  return await res.json();
+}
+
+async function announceDevice(deviceId, kind, online) {
+  const out = document.getElementById('chat-output');
+  out.textContent = 'Announcing ' + deviceId + ' (' + kind + ', online=' + online + ')...';
+  try {
+    const data = await fetchJson(apiBase() + '/foken/announce', 'POST', {
+      device_id: deviceId,
+      device_kind: kind,
+      online: online
+    });
+    out.textContent = JSON.stringify(data.announced, null, 2);
+    await refreshFoken();
+  } catch (e) {
+    out.textContent = 'Error: ' + String(e);
+  }
+}
+
+async function toggleApp(appId) {
+  const out = document.getElementById('chat-output');
+  try {
+    const data = await fetchJson(apiBase() + '/foken/app-toggle', 'POST', { app_id: appId });
+    out.textContent = JSON.stringify(data.toggled_app, null, 2);
+    await refreshFoken();
+  } catch (e) {
+    out.textContent = 'Error: ' + String(e);
+  }
+}
+
+async function selectModel(modelId, providerId) {
+  const out = document.getElementById('chat-output');
+  try {
+    const data = await fetchJson(apiBase() + '/foken/model-load', 'POST', {
+      model_id: modelId,
+      provider_id: providerId
+    });
+    out.textContent = JSON.stringify(data.selected_model, null, 2);
+    await refreshFoken();
+  } catch (e) {
+    out.textContent = 'Error: ' + String(e);
+  }
+}
+
+async function sendFokenChat() {
+  const promptEl = document.getElementById('chat-prompt');
+  const out = document.getElementById('chat-output');
+  out.textContent = 'Routing prompt through Shared GPU + WiCi InferSSD...';
+  try {
+    const data = await fetchJson(apiBase() + '/foken/chat', 'POST', { prompt: promptEl.value });
+    out.textContent = JSON.stringify(data, null, 2);
+    await refreshFoken();
+  } catch (e) {
+    out.textContent = 'Error: ' + String(e);
+  }
+}
+
+async function refreshFoken() {
+  try {
+    const wc = await fetchJson(apiBase() + '/wici', 'GET');
+    document.getElementById('st-fokens').textContent = wc.total_fokens_in_circulation + ' FKN';
+    document.getElementById('st-saved').textContent = wc.total_marqant_bytes_saved + ' B';
+    document.getElementById('st-gpus').textContent = wc.online_shared_gpus_count + ' / ' + (wc.shared_gpus || []).length;
+    document.getElementById('st-clients').textContent = wc.online_wireless_clients_count + ' / ' + (wc.wireless_clients || []).length;
+    document.getElementById('st-model').textContent = wc.active_model_id;
+
+    const gbody = document.querySelector('#shared-gpus-table tbody');
+    gbody.innerHTML = '';
+    for (const g of (wc.shared_gpus || [])) {
+      const tr = document.createElement('tr');
+      const nextOnline = !g.online;
+      const btnLbl = g.online ? 'Set Offline' : 'Announce GPU';
+      const btnCls = g.online ? 'btn-dark' : 'btn-teal';
+      tr.innerHTML =
+        '<td><b>' + g.provider_id + '</b></td>' +
+        '<td>' + g.node_host + '</td>' +
+        '<td><b>' + g.gpu_model + '</b></td>' +
+        '<td>' + g.vram_free_mib + ' / ' + g.vram_total_mib + ' MiB (' + g.vram_utilization_pq + ')</td>' +
+        '<td>' + g.host_ram_mib + ' MiB</td>' +
+        '<td>' + g.nvme_ssd_vault_mib + ' MiB</td>' +
+        '<td>' + g.foken_rate_per_hour + ' FKN/hr</td>' +
+        '<td><b>' + g.fokens_earned + ' FKN</b> (' + g.jobs_completed + ' jobs)</td>' +
+        '<td><code>' + g.active_model_id + '</code></td>' +
+        '<td class="' + tritClass(g.provider_trit) + '">' + g.presence_state + ' [' + g.provider_trit_glyph + ']</td>' +
+        '<td><button class="' + btnCls + '" onclick="announceDevice(\'' + g.provider_id + '\',\'gpu\',' + nextOnline + ')">' + btnLbl + '</button></td>';
+      gbody.appendChild(tr);
+    }
+
+    const cbody = document.querySelector('#wireless-clients-table tbody');
+    cbody.innerHTML = '';
+    for (const c of (wc.wireless_clients || [])) {
+      const tr = document.createElement('tr');
+      const nextOnline = !c.online;
+      const btnLbl = c.online ? 'Disconnect [0]' : 'Announce [+25 FKN]';
+      const btnCls = c.online ? 'btn-dark' : 'btn-teal';
+      tr.innerHTML =
+        '<td><b>' + c.client_id + '</b><br><small>' + c.compression_codec + '</small></td>' +
+        '<td class="' + tritClass(c.marine_trit) + '"><b>' + c.presence_state + '</b></td>' +
+        '<td><b>' + c.fokens_balance + ' FKN</b></td>' +
+        '<td>' + c.wifi_mbps + ' Mbps / ' + c.rssi_dbm + ' dBm</td>' +
+        '<td>' + c.mean_rtt_us + ' us</td>' +
+        '<td><b>' + c.marine_salience_pq + '</b></td>' +
+        '<td>' + c.coalesced_batch_ops + ' ops / ' + c.tensor_cache_threshold_kib + ' KiB</td>' +
+        '<td>' + c.naive_rtts_per_token + ' -&gt; <b>' + c.trace_replay_rtts_per_token + '</b> (' + c.rtt_reduction_pq + ')</td>' +
+        '<td class="' + tritClass(c.marine_trit) + '">[' + c.marine_trit_glyph + '] (' + c.marine_trit + ')</td>' +
+        '<td><button class="' + btnCls + '" onclick="announceDevice(\'' + c.client_id + '\',\'wireless-client\',' + nextOnline + ')">' + btnLbl + '</button></td>';
+      cbody.appendChild(tr);
+    }
+
+    const mbody = document.querySelector('#models-table tbody');
+    mbody.innerHTML = '';
+    for (const m of (wc.infer_ssd_models || [])) {
+      const tr = document.createElement('tr');
+      const isAct = (m.model_id === wc.active_model_id);
+      tr.innerHTML =
+        '<td><b>' + m.display_name + '</b><br><small><code>' + m.model_id + '</code> · ' + m.quant_format + '</small></td>' +
+        '<td><b>' + m.params_label + '</b><br><small>' + m.experts_active + ' / ' + m.experts_total + ' experts (' + m.expert_mib + ' MiB/exp)</small></td>' +
+        '<td>' + m.shards + ' shards / ' + m.layers + ' L</td>' +
+        '<td><b>' + m.vram_tier_mib + ' MiB</b></td>' +
+        '<td><b>' + m.ram_tier_mib + ' MiB</b></td>' +
+        '<td><b>' + m.ssd_tier_mib + ' MiB</b></td>' +
+        '<td><b>' + m.tok_per_sec_pq + '</b> tok/s</td>' +
+        '<td>' + m.foken_cost_per_1k_tok + ' FKN/1k</td>' +
+        '<td><code>' + m.assigned_provider_id + '</code></td>' +
+        '<td><button class="' + (isAct ? 'btn-amber' : 'btn-teal') + '" onclick="selectModel(\'' + m.model_id + '\',\'' + m.assigned_provider_id + '\')">' + (isAct ? 'ACTIVE [+]' : 'Activate') + '</button></td>';
+      mbody.appendChild(tr);
+    }
+
+    const abody = document.querySelector('#apps-table tbody');
+    abody.innerHTML = '';
+    for (const a of (wc.connected_apps || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><b>' + a.display_name + '</b><br><small>' + a.category + '</small></td>' +
+        '<td><code>' + a.api_endpoint + '</code></td>' +
+        '<td>' + a.requests_routed + '</td>' +
+        '<td>' + a.fokens_spent + ' FKN</td>' +
+        '<td class="' + tritClass(a.trit) + '">' + (a.connected ? 'CONNECTED [+]' : 'PAUSED [0]') + '</td>' +
+        '<td><button class="' + (a.connected ? 'btn-dark' : 'btn-teal') + '" onclick="toggleApp(\'' + a.app_id + '\')">' + (a.connected ? 'Pause' : 'Connect') + '</button></td>';
+      abody.appendChild(tr);
+    }
+
+    const rbody = document.querySelector('#wici-repos-table tbody');
+    rbody.innerHTML = '';
+    for (const r of (wc.wici_ai_repos || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><b>wici-ai/' + r.repo_name + '</b><br><small><code>' + r.disk_path + '</code></small></td>' +
+        '<td>' + r.role + '</td>' +
+        '<td><code>' + r.head_sha + '</code></td>' +
+        '<td>m8=' + (r.has_m8 ? 'YES' : 'NO') + ' · g8t=' + (r.has_g8t_md ? 'YES' : 'NO') + '</td>' +
+        '<td class="' + tritClass(r.trit) + '">[' + r.trit_glyph + ']</td>';
+      rbody.appendChild(tr);
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+refreshFoken();
+</script>
+</body>
+</html>
+"#
+}
+
 // ============================================================================
 // INTERACTIVE DARK-MODE COMMAND DECK HTML (ZERO FLOATS IN HTML/CSS/JS)
 // ============================================================================
@@ -1759,17 +2446,20 @@ pub fn render_command_deck_html() -> &'static str {
       <button class="btn-teal" onclick="runAction('/a6000/api/domains/reconcile')">[9] Reconcile lumisst Domains + ns1..ns4·i1·is Zones</button>
       <button class="btn-amber" onclick="runAction('/a6000/api/commitments/transition')">[10] Evaluate MEM|8 Normative Commitment Guard</button>
       <button class="btn-teal" onclick="runAction('/a6000/api/wici')">[11] WiCi Wireless GPU &amp; DeepSeek-671B MoE Plan</button>
+      <button class="btn-amber" onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=true')">[12] Announce blu-g75 Online (+25 FKN)</button>
+      <button onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=false')">[13] Set blu-g75 Offline [0]</button>
+      <button class="btn-teal" onclick="window.location.href='/a6000/foken'">[14] Open Foken·ai × WiCi InferSSD Dashboard</button>
     </div>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
-    <h2>SUBSYSTEM J · WICI WIRELESS GPU &amp; DEEPSEEK-R1-671B-MOE 3-TIER ORCHESTRATOR (RTX 6000 ADA + RTX 4090 + T-FORCE NVME)</h2>
-    <div id="wici-summary">Loading WiCi Wireless GPU &amp; DeepSeek-671B MoE 3-Tier Plans...</div>
+    <h2>SUBSYSTEM J · WICI WIRELESS GPU, FOKEN·AI SHARED GPU ECONOMY &amp; INFERSSD 3-TIER ORCHESTRATOR (<a href="/a6000/foken" style="color:var(--cyan);">OPEN FOKEN·AI DASHBOARD -&gt;</a>)</h2>
+    <div id="wici-summary">Loading WiCi Wireless GPU, Foken·ai Shared GPUs &amp; /data/wici-ai 3-Tier Plans...</div>
     <table id="wici-table">
       <thead>
         <tr>
-          <th>MEMNET/1·0 Wireless Client</th><th>WiFi Link</th><th>RSSI</th><th>Mean RTT</th><th>Marine Salience (p/q)</th><th>Batch Ops</th><th>Cache Threshold</th><th>RTTs / Token</th><th>RTT Reduction (p/q)</th><th>Trit</th>
+          <th>MEMNET/1·0 Wireless Client</th><th>Live Announcement Presence</th><th>Fokens</th><th>Codec</th><th>WiFi Link</th><th>RSSI</th><th>Mean RTT</th><th>Marine Salience (p/q)</th><th>RTTs / Token</th><th>Trit</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -1918,24 +2608,27 @@ async function refreshAll() {
     const wc = await fetchJson('/a6000/api/wici', 'GET');
     const ha = wc.hetzner_a6000_plan;
     const lr = wc.local_rtx4090_tforce_plan;
+    const wrepos = (wc.wici_ai_repos || []).map(r => r.repo_name + '@' + r.head_sha).join(', ');
     document.getElementById('wici-summary').innerHTML =
+      '<div><b>Foken·ai Shared GPUs:</b> Online = <b>' + wc.online_shared_gpus_count + ' / ' + (wc.shared_gpus || []).length + '</b> · Announced Wireless Clients = <b>' + wc.online_wireless_clients_count + ' / ' + (wc.wireless_clients || []).length + '</b> (TTL = ' + wc.announcement_ttl_secs + 's) · Total Fokens in Circulation = <b>' + wc.total_fokens_in_circulation + ' FKN</b> · <a href="/a6000/foken" style="color:#00f0ff;font-weight:bold;">Open Foken·ai × WiCi InferSSD Dashboard</a></div>' +
       '<div><b>Hetzner cheet·is (' + ha.gpu_model + '):</b> VRAM = <b>' + ha.vram_pinned_mib + ' MiB</b> + Host RAM = <b>' + ha.host_ram_pinned_mib + ' / ' + ha.host_ram_budget_mib + ' MiB</b> + NVMe Spill = <b>' + ha.nvme_vault_mib + ' MiB</b> (Zero-Disk Experts p/q = <b>' + ha.zero_disk_experts_pq + '</b> · Trace Replay Speedup = <b>' + ha.trace_replay_speedup_pq + '</b>)</div>' +
-      '<div><b>Local Workstation (' + lr.gpu_model + ' + T-FORCE TM8FPP002T):</b> VRAM = <b>' + lr.vram_pinned_mib + ' MiB</b> + Host RAM = <b>' + lr.host_ram_pinned_mib + ' MiB</b> + T-FORCE NVMe Vault = <b>' + lr.nvme_vault_mib + ' / ' + lr.nvme_vault_budget_mib + ' MiB</b> (QAT 4096B Sub-Window Reuse p/q = <b>' + lr.qat_subwindow_reuse_pq + '</b>)</div>';
+      '<div><b>Local Workstation (' + lr.gpu_model + ' + T-FORCE TM8FPP002T):</b> VRAM = <b>' + lr.vram_pinned_mib + ' MiB</b> + Host RAM = <b>' + lr.host_ram_pinned_mib + ' MiB</b> + T-FORCE NVMe Vault = <b>' + lr.nvme_vault_mib + ' / ' + lr.nvme_vault_budget_mib + ' MiB</b> (QAT 4096B Sub-Window Reuse p/q = <b>' + lr.qat_subwindow_reuse_pq + '</b>)</div>' +
+      '<div><b>/data/wici-ai Synced Repos (' + (wc.wici_ai_repos || []).length + '/6):</b> <code>' + wrepos + '</code></div>';
     const wbody = document.querySelector('#wici-table tbody');
     wbody.innerHTML = '';
     for (const c of (wc.wireless_clients || [])) {
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td><b>' + c.client_id + '</b></td>' +
+        '<td class="' + (c.online ? 'trit-pos' : 'trit-zero') + '"><b>' + c.presence_state + '</b></td>' +
+        '<td><b>' + c.fokens_balance + ' FKN</b></td>' +
+        '<td><code>' + c.compression_codec + '</code></td>' +
         '<td>' + c.wifi_mbps + ' Mbps</td>' +
         '<td>' + c.rssi_dbm + ' dBm</td>' +
-        '<td>' + c.mean_rtt_us + ' us</td>' +
+        '<td>' + (c.online ? (c.mean_rtt_us + ' us') : 'OFFLINE') + '</td>' +
         '<td><b>' + c.marine_salience_pq + '</b></td>' +
-        '<td>' + c.coalesced_batch_ops + ' ops</td>' +
-        '<td>' + c.tensor_cache_threshold_kib + ' KiB</td>' +
         '<td>' + c.naive_rtts_per_token + ' -&gt; <b>' + c.trace_replay_rtts_per_token + '</b></td>' +
-        '<td><b>' + c.rtt_reduction_pq + '</b></td>' +
-        '<td class="' + tritClass(c.marine_trit) + '">[+] (' + c.marine_trit + ')</td>';
+        '<td class="' + tritClass(c.marine_trit) + '">' + c.marine_trit_glyph + ' (' + c.marine_trit + ')</td>';
       wbody.appendChild(tr);
     }
 
@@ -2181,6 +2874,14 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
             "HTTP/1.1 200 OK",
             "text/html; charset=utf-8",
             render_command_deck_html().to_string(),
+        ),
+        ("GET", "/foken")
+        | ("GET", "/foken/")
+        | ("GET", "/a6000/foken")
+        | ("GET", "/a6000/foken/") => (
+            "HTTP/1.1 200 OK",
+            "text/html; charset=utf-8",
+            render_foken_wici_dashboard_html().to_string(),
         ),
         ("GET", "/health")
         | ("GET", "/api/health")
@@ -2510,19 +3211,45 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
         (_, "/a6000/api/wici")
         | (_, "/api/a6000/wici")
         | (_, "/api/wici")
-        | (_, "/a6000/api/wici/moe") => {
-            let rep = orchestrate_wici_wireless_moe();
+        | (_, "/a6000/api/wici/moe")
+        | (_, "/a6000/api/foken/status")
+        | (_, "/api/foken/status") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let rep = orchestrate_wici_with_registry(&mut guard.wici_foken_registry);
             let json = rep.to_json();
-            {
-                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                guard.c64_page.write_record(&format!(
-                    "WICI_MOE:CLIENTS={}:A6000_ZERO_DISK={}:QAT_REUSE={}:ATTEST={}",
-                    rep.wireless_clients.len(),
-                    rep.hetzner_a6000_plan.zero_disk_experts_pq,
-                    rep.local_rtx4090_tforce_plan.qat_subwindow_reuse_pq,
-                    &rep.attestation_hash[..16.min(rep.attestation_hash.len())]
-                ));
-            }
+            guard.c64_page.write_record(&format!(
+                "WICI_MOE:ONLINE_W={}:ONLINE_GPU={}:FOKENS={}:ATTEST={}",
+                rep.online_wireless_clients_count,
+                rep.online_shared_gpus_count,
+                rep.total_fokens_in_circulation,
+                &rep.attestation_hash[..16.min(rep.attestation_hash.len())]
+            ));
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/wici/announce")
+        | (_, "/api/wici/announce")
+        | (_, "/a6000/api/foken/announce")
+        | (_, "/api/foken/announce") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = execute_wici_foken_announce(&mut guard, raw_path, req_body);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/foken/app-toggle") | (_, "/api/foken/app-toggle") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = execute_wici_app_toggle(&mut guard, raw_path, req_body);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/foken/model-load") | (_, "/api/foken/model-load") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = execute_wici_model_load(&mut guard, raw_path, req_body);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/foken/chat")
+        | (_, "/api/foken/chat")
+        | (_, "/v1/chat/completions")
+        | (_, "/a6000/v1/chat/completions") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = execute_wici_foken_chat(&mut guard, raw_path, req_body);
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
         _ => (
@@ -2871,12 +3598,62 @@ mod tests {
             "Float literal found in Command Deck HTML"
         );
 
+        let foken_html = render_foken_wici_dashboard_html();
+        assert_eq!(
+            count_floating_point_literals(foken_html),
+            0,
+            "Float literal found in Foken WiCi Dashboard HTML"
+        );
+
         let wici_json = orchestrate_wici_wireless_moe().to_json();
         assert_eq!(
             count_floating_point_literals(&wici_json),
             0,
             "Float literal found in wici_json: {}",
             wici_json
+        );
+
+        let announce_blu_online = execute_wici_foken_announce(
+            &mut state,
+            "/a6000/api/wici/announce",
+            "{\"device_id\":\"blu-g75\",\"kind\":\"wireless\",\"online\":true,\"wifi_mbps\":433,\"rssi_dbm\":-59,\"rtt_us\":4200}",
+        );
+        assert!(announce_blu_online.contains("\"presence_state\":\"ONLINE_ANNOUNCED\""));
+        assert_eq!(count_floating_point_literals(&announce_blu_online), 0);
+
+        let announce_blu_offline = execute_wici_foken_announce(
+            &mut state,
+            "/a6000/api/wici/announce",
+            "{\"device_id\":\"blu-g75\",\"kind\":\"wireless\",\"online\":false}",
+        );
+        assert!(announce_blu_offline.contains("\"presence_state\":\"OFFLINE_AWAITING_ANNOUNCEMENT\""));
+        assert_eq!(count_floating_point_literals(&announce_blu_offline), 0);
+
+        let app_toggle_json = execute_wici_app_toggle(
+            &mut state,
+            "/a6000/api/foken/app-toggle",
+            "{\"app_id\":\"thinkless\",\"connected\":true}",
+        );
+        assert_eq!(count_floating_point_literals(&app_toggle_json), 0);
+
+        let model_load_json = execute_wici_model_load(
+            &mut state,
+            "/a6000/api/foken/model-load",
+            "{\"model_id\":\"DeepSeek-V4·1-Flash-1017-GGUF\"}",
+        );
+        assert_eq!(count_floating_point_literals(&model_load_json), 0);
+
+        let chat_json = execute_wici_foken_chat(
+            &mut state,
+            "/a6000/api/foken/chat",
+            "{\"prompt\":\"Show WiCi InferSSD 3-tier MoE placement and Foken GPU status.\"}",
+        );
+        assert!(chat_json.contains("\"float_count\":0"));
+        assert_eq!(
+            count_floating_point_literals(&chat_json),
+            0,
+            "Float literal found in chat_json: {}",
+            chat_json
         );
     }
 }

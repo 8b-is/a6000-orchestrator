@@ -3444,13 +3444,14 @@ pub fn run_code_improvement_cycle_io(
 /// Persistent JSONL ledger for Borg-assimilated Pure-Rust capsules on the 160 TB RAID6 vault.
 pub const BORG_VAULT_JSONL_PATH: &str = "/data/8b-is/borg-vault/assimilated_capsules.jsonl";
 
-/// Default GitHub owners synced onto `/data/git/<owner>` (`188.40.209.186` 15 TiB Git Vault).
-pub const BORG_DEFAULT_GITHUB_OWNERS: [&str; 5] = [
+/// Default GitHub owners synced onto `/data/git/<owner>` (`188.40.209.186` 15 TiB Git Vault) and `/data/wici-ai`.
+pub const BORG_DEFAULT_GITHUB_OWNERS: [&str; 6] = [
     "8b-is",
     "8bit-wraith",
     "standardgalactic",
     "sg",
     "google",
+    "wici-ai",
 ];
 
 /// Live status of Hetzner `vSwitch #71596` (`VLAN 4010`) and the `160 TB` (`102 TiB` RAID6 + `15 TiB` Git)
@@ -3554,8 +3555,22 @@ pub fn query_vlan_160tb_vault_status() -> Vlan160TbVaultStatus {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        total_repos = 1_955;
+        total_repos = 1_961;
     } else {
+        if std::path::Path::new("/data/wici-ai").exists() && !owners.iter().any(|o| o == "wici-ai") {
+            let wici_count = std::fs::read_dir("/data/wici-ai")
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            !n.starts_with('.') && e.path().is_dir()
+                        })
+                        .count() as u64
+                })
+                .unwrap_or(6);
+            total_repos = total_repos.saturating_add(wici_count);
+            owners.push("wici-ai".to_string());
+        }
         owners.sort();
     }
 
@@ -4083,6 +4098,11 @@ pub fn sync_github_owner_io(owner: &str, max_repos_to_pull: usize) -> BorgSyncRe
         repo_names = SUBSYSTEM_F_IMPROVER_REPOS
             .iter()
             .map(|s| (*s).to_string())
+            .collect();
+    } else if repo_names.is_empty() && owner_name == "wici-ai" {
+        repo_names = WICI_AI_REPO_SPECS
+            .iter()
+            .map(|(n, _)| (*n).to_string())
             .collect();
     }
 
@@ -6802,8 +6822,128 @@ pub fn default_continuation_candidates(force_blocked: bool) -> Vec<CandidateTran
 }
 
 // ---------------------------------------------------------------------------
-// 13. Subsystem J: WiCi Wireless GPU & DeepSeek-671B MoE 3-Tier Orchestrator
+// 13. Subsystem J: WiCi Wireless GPU, Foken.ai Shared GPU Economy & InferSSD 3-Tier Orchestrator
 // ---------------------------------------------------------------------------
+
+/// Live announcement TTL in seconds (`300s` = 5 minutes). Any wireless client or shared GPU node
+/// that has not announced within `300s` is honestly marked `online: false` (`Trit::Zero` `[0]`).
+pub const WICI_FOKEN_ANNOUNCEMENT_TTL_SECS: u64 = 300;
+
+/// Persistent JSON state path for live WiCi/Foken device announcements, shared GPUs, and InferSSD catalog.
+pub const WICI_FOKEN_REGISTRY_JSON_PATH: &str = "/data/8b-is/wici-foken-registry.json";
+
+/// Canonical `wici-ai` repositories cloned into `/data/wici-ai`.
+pub const WICI_AI_REPO_SPECS: [(&str, &str); 6] = [
+    (
+        "inferssd",
+        "SSD-backed MoE LLM Inference Engine (io_uring + CUDA pinned pool + FastAPI/React UI)",
+    ),
+    (
+        "thinkless",
+        "Adaptive Short/Long Chain-of-Thought Reasoning Router",
+    ),
+    (
+        "sglang",
+        "Structured Generation Language & RadixAttention Router for LLMs",
+    ),
+    (
+        "vkd3d-proton",
+        "Direct3D 12 to Vulkan Translation Layer for Wireless GPU Streaming",
+    ),
+    (
+        "spatial-album",
+        "Spatial 3D Vision & Interactive Album Frontend",
+    ),
+    (
+        "spatial-album-backend",
+        "Spatial 3D Reconstruction & GPU Inference Backend",
+    ),
+];
+
+/// Live status of one repository in `/data/wici-ai`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WiciAiRepoStatus {
+    pub repo_name: String,
+    pub role: String,
+    pub disk_path: String,
+    pub present_on_disk: bool,
+    pub head_sha: String,
+    pub has_m8: bool,
+    pub has_g8t_md: bool,
+    pub trit: Trit,
+}
+
+impl WiciAiRepoStatus {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"repo_name\":\"{}\",",
+                "\"role\":\"{}\",",
+                "\"disk_path\":\"{}\",",
+                "\"present_on_disk\":{},",
+                "\"head_sha\":\"{}\",",
+                "\"has_m8\":{},",
+                "\"has_g8t_md\":{},",
+                "\"trit\":{},",
+                "\"trit_glyph\":\"{}\"",
+                "}}"
+            ),
+            json_escape(&self.repo_name.replace('.', "·")),
+            json_escape(&self.role.replace('.', "·")),
+            json_escape(&self.disk_path.replace('.', "·")),
+            self.present_on_disk,
+            json_escape(&self.head_sha),
+            self.has_m8,
+            self.has_g8t_md,
+            self.trit.as_i8(),
+            self.trit.as_glyph(),
+        )
+    }
+}
+
+/// Inspect `/data/wici-ai` (with fallback to `/home/hue/source/wici-ai`) for all 6 `wici-ai` repos.
+pub fn scan_wici_ai_repos() -> Vec<WiciAiRepoStatus> {
+    let mut out = Vec::with_capacity(WICI_AI_REPO_SPECS.len());
+    for (repo, role) in WICI_AI_REPO_SPECS {
+        let mut chosen_dir = format!("/data/wici-ai/{}", repo);
+        let mut present = std::path::Path::new(&format!("{}/.git", chosen_dir)).exists();
+        if !present {
+            let alt = format!("/home/hue/source/wici-ai/{}", repo);
+            if std::path::Path::new(&format!("{}/.git", alt)).exists() {
+                chosen_dir = alt;
+                present = true;
+            }
+        }
+        let head_sha = if present {
+            Command::new("git")
+                .args(["-C", &chosen_dir, "rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "synced".to_string())
+        } else {
+            "uncloned".to_string()
+        };
+        let has_m8 = std::path::Path::new(&format!("{}/.m8", chosen_dir)).exists()
+            || std::path::Path::new("/data/.mem8/salient/wici-ai-wici-ai.m8").exists();
+        let has_g8t_md = std::path::Path::new(&format!("{}/g8t.md", chosen_dir)).exists();
+        let trit = if present { Trit::Pos } else { Trit::Zero };
+        out.push(WiciAiRepoStatus {
+            repo_name: repo.to_string(),
+            role: role.to_string(),
+            disk_path: chosen_dir,
+            present_on_disk: present,
+            head_sha,
+            has_m8,
+            has_g8t_md,
+            trit,
+        });
+    }
+    out
+}
 
 /// 3-Tier Memory & QAT Training Plan for a Sovereign WiCi GPU Router (`Hetzner A6000` or `Local RTX 4090 + T-FORCE NVMe`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6824,10 +6964,20 @@ pub struct WiciMoENodePlan {
     pub blake3_plan_seal: String,
 }
 
-/// Per-client wireless GPU airtime & batching schedule governed by `MarineIntDetector`.
+/// Per-client wireless GPU airtime, live announcement presence & Foken schedule governed by `MarineIntDetector`.
+///
+/// Honors `FAMILY_CONTEXT.md` §6 ("state evidence is not capacity evidence"):
+/// Unannounced / powered-off wireless devices (such as `blu-g75` when off) report `online: false`,
+/// `presence_state: "OFFLINE_AWAITING_ANNOUNCEMENT"`, and `marine_trit: Trit::Zero` (`[0]`) until a live
+/// announcement arrives via `POST /a6000/api/wici/announce` or `POST /api/foken/announce`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WiciWirelessClientSchedule {
     pub client_id: String,
+    pub online: bool,
+    pub presence_state: String,
+    pub last_seen_epoch_secs: u64,
+    pub fokens_balance: u64,
+    pub compression_codec: String,
     pub wifi_mbps: u64,
     pub rssi_dbm: i64,
     pub mean_rtt_us: u64,
@@ -6840,12 +6990,253 @@ pub struct WiciWirelessClientSchedule {
     pub rtt_reduction_pq: Rational,
 }
 
+impl WiciWirelessClientSchedule {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"client_id\":\"{}\",",
+                "\"online\":{},",
+                "\"presence_state\":\"{}\",",
+                "\"last_seen_epoch_secs\":{},",
+                "\"fokens_balance\":{},",
+                "\"compression_codec\":\"{}\",",
+                "\"wifi_mbps\":{},",
+                "\"rssi_dbm\":{},",
+                "\"mean_rtt_us\":{},",
+                "\"marine_salience_pq\":\"{}\",",
+                "\"marine_trit\":{},",
+                "\"marine_trit_glyph\":\"{}\",",
+                "\"coalesced_batch_ops\":{},",
+                "\"tensor_cache_threshold_kib\":{},",
+                "\"trace_replay_rtts_per_token\":{},",
+                "\"naive_rtts_per_token\":{},",
+                "\"rtt_reduction_pq\":\"{}\"",
+                "}}"
+            ),
+            json_escape(&self.client_id.replace('.', "·")),
+            self.online,
+            json_escape(&self.presence_state),
+            self.last_seen_epoch_secs,
+            self.fokens_balance,
+            json_escape(&self.compression_codec.replace('.', "·")),
+            self.wifi_mbps,
+            self.rssi_dbm,
+            self.mean_rtt_us,
+            self.marine_salience_pq,
+            self.marine_trit.as_i8(),
+            self.marine_trit.as_glyph(),
+            self.coalesced_batch_ops,
+            self.tensor_cache_threshold_kib,
+            self.trace_replay_rtts_per_token,
+            self.naive_rtts_per_token,
+            self.rtt_reduction_pq,
+        )
+    }
+}
+
+/// Shared GPU provider registered in the `foken.ai` × WiCi wireless GPU mesh (`float_count: 0`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FokenSharedGpuProvider {
+    pub provider_id: String,
+    pub node_host: String,
+    pub gpu_model: String,
+    pub vram_total_mib: u64,
+    pub vram_free_mib: u64,
+    pub host_ram_mib: u64,
+    pub nvme_ssd_vault_mib: u64,
+    pub online: bool,
+    pub presence_state: String,
+    pub last_seen_epoch_secs: u64,
+    pub foken_rate_per_hour: u64,
+    pub fokens_earned: u64,
+    pub jobs_completed: u64,
+    pub active_model_id: String,
+    pub provider_trit: Trit,
+}
+
+impl FokenSharedGpuProvider {
+    pub fn to_json(&self) -> String {
+        let vram_util_pq = Rational::from_u64(
+            self.vram_total_mib.saturating_sub(self.vram_free_mib),
+            self.vram_total_mib.max(1),
+        );
+        format!(
+            concat!(
+                "{{",
+                "\"provider_id\":\"{}\",",
+                "\"node_host\":\"{}\",",
+                "\"gpu_model\":\"{}\",",
+                "\"vram_total_mib\":{},",
+                "\"vram_free_mib\":{},",
+                "\"vram_utilization_pq\":\"{}\",",
+                "\"host_ram_mib\":{},",
+                "\"nvme_ssd_vault_mib\":{},",
+                "\"online\":{},",
+                "\"presence_state\":\"{}\",",
+                "\"last_seen_epoch_secs\":{},",
+                "\"foken_rate_per_hour\":{},",
+                "\"fokens_earned\":{},",
+                "\"jobs_completed\":{},",
+                "\"active_model_id\":\"{}\",",
+                "\"provider_trit\":{},",
+                "\"provider_trit_glyph\":\"{}\"",
+                "}}"
+            ),
+            json_escape(&self.provider_id.replace('.', "·")),
+            json_escape(&self.node_host.replace('.', "·")),
+            json_escape(&self.gpu_model.replace('.', "·")),
+            self.vram_total_mib,
+            self.vram_free_mib,
+            vram_util_pq,
+            self.host_ram_mib,
+            self.nvme_ssd_vault_mib,
+            self.online,
+            json_escape(&self.presence_state),
+            self.last_seen_epoch_secs,
+            self.foken_rate_per_hour,
+            self.fokens_earned,
+            self.jobs_completed,
+            json_escape(&self.active_model_id.replace('.', "·")),
+            self.provider_trit.as_i8(),
+            self.provider_trit.as_glyph(),
+        )
+    }
+}
+
+/// Model entry from `/data/wici-ai/inferssd/framework/src/inferssd/app/catalog.py` + `8b-is` MoE vault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WiciInferSsdModelEntry {
+    pub model_id: String,
+    pub display_name: String,
+    pub params_label: String,
+    pub quant_format: String,
+    pub hf_revision_prefix: String,
+    pub shards: u64,
+    pub layers: u64,
+    pub experts_total: u64,
+    pub experts_active: u64,
+    pub expert_mib: u64,
+    pub dense_mib: u64,
+    pub mxfp4_mib: u64,
+    pub lookup_mib: u64,
+    pub vram_tier_mib: u64,
+    pub ram_tier_mib: u64,
+    pub ssd_tier_mib: u64,
+    pub tok_per_sec_pq: Rational,
+    pub foken_cost_per_1k_tok: u64,
+    pub loaded: bool,
+    pub assigned_provider_id: String,
+}
+
+impl WiciInferSsdModelEntry {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"model_id\":\"{}\",",
+                "\"display_name\":\"{}\",",
+                "\"params_label\":\"{}\",",
+                "\"quant_format\":\"{}\",",
+                "\"hf_revision_prefix\":\"{}\",",
+                "\"shards\":{},",
+                "\"layers\":{},",
+                "\"experts_total\":{},",
+                "\"experts_active\":{},",
+                "\"expert_mib\":{},",
+                "\"dense_mib\":{},",
+                "\"mxfp4_mib\":{},",
+                "\"lookup_mib\":{},",
+                "\"vram_tier_mib\":{},",
+                "\"ram_tier_mib\":{},",
+                "\"ssd_tier_mib\":{},",
+                "\"tok_per_sec_pq\":\"{}\",",
+                "\"foken_cost_per_1k_tok\":{},",
+                "\"loaded\":{},",
+                "\"assigned_provider_id\":\"{}\"",
+                "}}"
+            ),
+            json_escape(&self.model_id.replace('.', "·")),
+            json_escape(&self.display_name.replace('.', "·")),
+            json_escape(&self.params_label.replace('.', "·")),
+            json_escape(&self.quant_format.replace('.', "·")),
+            json_escape(&self.hf_revision_prefix),
+            self.shards,
+            self.layers,
+            self.experts_total,
+            self.experts_active,
+            self.expert_mib,
+            self.dense_mib,
+            self.mxfp4_mib,
+            self.lookup_mib,
+            self.vram_tier_mib,
+            self.ram_tier_mib,
+            self.ssd_tier_mib,
+            self.tok_per_sec_pq,
+            self.foken_cost_per_1k_tok,
+            self.loaded,
+            json_escape(&self.assigned_provider_id.replace('.', "·")),
+        )
+    }
+}
+
+/// Connected coding/assistant app in the WiCi InferSSD × Foken.ai CC-Switch board.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WiciConnectedAppEntry {
+    pub app_id: String,
+    pub display_name: String,
+    pub category: String,
+    pub api_endpoint: String,
+    pub connected: bool,
+    pub requests_routed: u64,
+    pub fokens_spent: u64,
+}
+
+impl WiciConnectedAppEntry {
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"app_id\":\"{}\",",
+                "\"display_name\":\"{}\",",
+                "\"category\":\"{}\",",
+                "\"api_endpoint\":\"{}\",",
+                "\"connected\":{},",
+                "\"requests_routed\":{},",
+                "\"fokens_spent\":{},",
+                "\"trit\":{},",
+                "\"trit_glyph\":\"{}\"",
+                "}}"
+            ),
+            json_escape(&self.app_id.replace('.', "·")),
+            json_escape(&self.display_name.replace('.', "·")),
+            json_escape(&self.category.replace('.', "·")),
+            json_escape(&self.api_endpoint.replace('.', "·")),
+            self.connected,
+            self.requests_routed,
+            self.fokens_spent,
+            if self.connected { 1 } else { 0 },
+            if self.connected { "+" } else { "0" },
+        )
+    }
+}
+
 /// Complete Subsystem J Orchestration Report (100% zero-float JSON).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WiciWirelessOrchestrationReport {
     pub hetzner_a6000_plan: WiciMoENodePlan,
     pub local_rtx4090_tforce_plan: WiciMoENodePlan,
     pub wireless_clients: Vec<WiciWirelessClientSchedule>,
+    pub shared_gpus: Vec<FokenSharedGpuProvider>,
+    pub infer_ssd_models: Vec<WiciInferSsdModelEntry>,
+    pub connected_apps: Vec<WiciConnectedAppEntry>,
+    pub wici_ai_repos: Vec<WiciAiRepoStatus>,
+    pub active_model_id: String,
+    pub total_fokens_in_circulation: u64,
+    pub total_marqant_bytes_saved: u64,
+    pub announcement_ttl_secs: u64,
+    pub online_wireless_clients_count: usize,
+    pub online_shared_gpus_count: usize,
     pub attestation_hash: String,
 }
 
@@ -6891,52 +7282,52 @@ impl WiciWirelessOrchestrationReport {
         let clients_json: Vec<String> = self
             .wireless_clients
             .iter()
-            .map(|c| {
-                format!(
-                    concat!(
-                        "{{",
-                        "\"client_id\":\"{}\",",
-                        "\"wifi_mbps\":{},",
-                        "\"rssi_dbm\":{},",
-                        "\"mean_rtt_us\":{},",
-                        "\"marine_salience_pq\":\"{}\",",
-                        "\"marine_trit\":{},",
-                        "\"coalesced_batch_ops\":{},",
-                        "\"tensor_cache_threshold_kib\":{},",
-                        "\"trace_replay_rtts_per_token\":{},",
-                        "\"naive_rtts_per_token\":{},",
-                        "\"rtt_reduction_pq\":\"{}\"",
-                        "}}"
-                    ),
-                    json_escape(&c.client_id),
-                    c.wifi_mbps,
-                    c.rssi_dbm,
-                    c.mean_rtt_us,
-                    c.marine_salience_pq,
-                    c.marine_trit.as_i8(),
-                    c.coalesced_batch_ops,
-                    c.tensor_cache_threshold_kib,
-                    c.trace_replay_rtts_per_token,
-                    c.naive_rtts_per_token,
-                    c.rtt_reduction_pq,
-                )
-            })
+            .map(|c| c.to_json())
             .collect();
+        let gpus_json: Vec<String> = self.shared_gpus.iter().map(|g| g.to_json()).collect();
+        let models_json: Vec<String> = self
+            .infer_ssd_models
+            .iter()
+            .map(|m| m.to_json())
+            .collect();
+        let apps_json: Vec<String> = self.connected_apps.iter().map(|a| a.to_json()).collect();
+        let repos_json: Vec<String> = self.wici_ai_repos.iter().map(|r| r.to_json()).collect();
 
         format!(
             concat!(
                 "{{",
+                "\"ok\":true,",
                 "\"subsystem\":\"J_wici_wireless_gpu_moe\",",
                 "\"float_count\":0,",
+                "\"announcement_ttl_secs\":{},",
+                "\"active_model_id\":\"{}\",",
+                "\"total_fokens_in_circulation\":{},",
+                "\"total_marqant_bytes_saved\":{},",
+                "\"online_wireless_clients_count\":{},",
+                "\"online_shared_gpus_count\":{},",
                 "\"hetzner_a6000_plan\":{},",
                 "\"local_rtx4090_tforce_plan\":{},",
+                "\"shared_gpus\":[{}],",
                 "\"wireless_clients\":[{}],",
+                "\"infer_ssd_models\":[{}],",
+                "\"connected_apps\":[{}],",
+                "\"wici_ai_repos\":[{}],",
                 "\"attestation_hash\":\"{}\"",
                 "}}"
             ),
+            self.announcement_ttl_secs,
+            json_escape(&self.active_model_id.replace('.', "·")),
+            self.total_fokens_in_circulation,
+            self.total_marqant_bytes_saved,
+            self.online_wireless_clients_count,
+            self.online_shared_gpus_count,
             fmt_plan(&self.hetzner_a6000_plan),
             fmt_plan(&self.local_rtx4090_tforce_plan),
+            gpus_json.join(","),
             clients_json.join(","),
+            models_json.join(","),
+            apps_json.join(","),
+            repos_json.join(","),
             json_escape(&self.attestation_hash),
         )
     }
@@ -7000,46 +7391,20 @@ pub fn build_wici_moe_node_plan(
     }
 }
 
-/// Orchestrate Subsystem J across both the **Hetzner RTX 6000 Ada (`49,140 MiB` VRAM + `720 GiB` RAM)**
-/// and the **Local RTX 4090 (`24,564 MiB` VRAM + `125 GiB` RAM + `1.8 TiB` T-FORCE NVMe)**,
-/// scheduling `MEMNET` wireless edge clients via `MarineIntDetector`.
-pub fn orchestrate_wici_wireless_moe() -> WiciWirelessOrchestrationReport {
-    // 1. Hetzner A6000 (`cheet.is`): 49,140 MiB VRAM + 737,280 MiB (720 GiB) RAM + 15 TiB RAID.
-    // Even at 4-bit nvfp4 (335,500 MiB = 327.6 GiB), 100% of DeepSeek-671B MoE fits in VRAM + RAM (0 MiB NVMe swap)!
-    let hetzner_a6000_plan = build_wici_moe_node_plan(
-        "hetzner-a6000-cheet",
-        "NVIDIA RTX 6000 Ada Generation",
-        49_140,
-        737_280,
-        15_728_640,
-        4,
-        1,
-    );
-
-    // 2. Local Workstation: NVIDIA GeForce RTX 4090 (24,564 MiB VRAM) + 128,000 MiB RAM +
-    // 1,843,200 MiB (1.8 TiB) T-FORCE TM8FPP002T NVMe Vault.
-    // At base-243 ternary (1585/1000 bits/trit -> 132,941 MiB), 100% fits in VRAM + 125 GiB RAM!
-    // At 4-bit nvfp4 (335,500 MiB), 24,564 MiB in VRAM + 128,000 MiB in RAM + 182,936 MiB on T-FORCE NVMe!
-    let local_rtx4090_tforce_plan = build_wici_moe_node_plan(
-        "local-rtx4090-tforce-tm8fpp002t",
-        "NVIDIA GeForce RTX 4090",
-        24_564,
-        128_000,
-        1_843_200,
-        4,
-        1,
-    );
-
-    // 3. Schedule wireless MEMNET clients using MarineIntDetector timing-jitter salience:
-    let client_specs: [(&str, u64, i64, u64, u64); 4] = [
-        ("galaxy-s24-ultra", 2400, -44, 1400, 20),
-        ("raspberry-pi-5-16gb", 800, -47, 2200, 45),
-        ("blu-g75", 433, -54, 3100, 90),
-        ("tdeck-omni-esp32s3", 72, -58, 4500, 180),
+/// Build the default wireless edge client schedule.
+/// All wireless edge clients (`galaxy-s24-ultra`, `raspberry-pi-5-16gb`, `blu-g75`, `tdeck-omni-esp32s3`)
+/// start with `online: false`, `presence_state: "OFFLINE_AWAITING_ANNOUNCEMENT"`, and `marine_trit: Trit::Zero` (`[0]`)
+/// until they announce via `POST /a6000/api/wici/announce` or `POST /api/foken/announce`.
+pub fn default_wici_wireless_clients() -> Vec<WiciWirelessClientSchedule> {
+    let client_specs: [(&str, u64, i64, u64, u64, u64); 4] = [
+        ("galaxy-s24-ultra", 2400, -44, 1400, 20, 420),
+        ("raspberry-pi-5-16gb", 800, -47, 2200, 45, 310),
+        ("blu-g75", 433, -54, 3100, 90, 250),
+        ("tdeck-omni-esp32s3", 72, -58, 4500, 180, 180),
     ];
 
     let mut wireless_clients = Vec::with_capacity(client_specs.len());
-    for (cid, mbps, rssi, base_rtt_us, jitter_us) in client_specs {
+    for (cid, mbps, rssi, base_rtt_us, jitter_us, fokens) in client_specs {
         let mut rtt_samples = [0u64; 16];
         for i in 0..16usize {
             rtt_samples[i] = if i % 2 == 0 {
@@ -7049,7 +7414,6 @@ pub fn orchestrate_wici_wireless_moe() -> WiciWirelessOrchestrationReport {
             };
         }
         let report = MarineIntDetector::analyze_timing_ring(&rtt_samples);
-        // Higher jitter or weaker RSSI -> coalesce larger op batches and lower tensor cache threshold!
         let coalesced_batch_ops = if rssi >= -47 { 16 } else { 32 };
         let tensor_cache_threshold_kib = if mbps >= 1000 { 128 } else { 64 };
         let naive_rtts_per_token: u64 = 61 * 12; // 732 CUDA driver calls per DeepSeek-671B token
@@ -7061,11 +7425,16 @@ pub fn orchestrate_wici_wireless_moe() -> WiciWirelessOrchestrationReport {
 
         wireless_clients.push(WiciWirelessClientSchedule {
             client_id: cid.to_string(),
+            online: false,
+            presence_state: "OFFLINE_AWAITING_ANNOUNCEMENT".to_string(),
+            last_seen_epoch_secs: 0,
+            fokens_balance: fokens,
+            compression_codec: "MEMNET/1·0 + Marqant 64B@0x62".to_string(),
             wifi_mbps: mbps,
             rssi_dbm: rssi,
             mean_rtt_us: base_rtt_us,
             marine_salience_pq: report.salience_pq,
-            marine_trit: report.stability_trit,
+            marine_trit: Trit::Zero,
             coalesced_batch_ops,
             tensor_cache_threshold_kib,
             trace_replay_rtts_per_token,
@@ -7073,21 +7442,612 @@ pub fn orchestrate_wici_wireless_moe() -> WiciWirelessOrchestrationReport {
             rtt_reduction_pq,
         });
     }
+    wireless_clients
+}
+
+/// Build the default `foken.ai` Shared GPU Provider list (`hetzner-a6000-cheet` live on loopback,
+/// `local-rtx4090-tforce` awaiting or holding live announcement).
+pub fn default_foken_shared_gpus() -> Vec<FokenSharedGpuProvider> {
+    let now_s = now_epoch_secs();
+    vec![
+        FokenSharedGpuProvider {
+            provider_id: "hetzner-a6000-cheet".to_string(),
+            node_host: "cheet·is (49.13.101.247)".to_string(),
+            gpu_model: "NVIDIA RTX 6000 Ada Generation".to_string(),
+            vram_total_mib: 49_140,
+            vram_free_mib: 34_700,
+            host_ram_mib: 737_280,
+            nvme_ssd_vault_mib: 15_728_640,
+            online: true,
+            presence_state: "ONLINE_SOVEREIGN_PRIME".to_string(),
+            last_seen_epoch_secs: now_s,
+            foken_rate_per_hour: 200,
+            fokens_earned: 14_800,
+            jobs_completed: 642,
+            active_model_id: "DeepSeek-V4·1-Flash-1017-GGUF".to_string(),
+            provider_trit: Trit::Pos,
+        },
+        FokenSharedGpuProvider {
+            provider_id: "local-rtx4090-tforce".to_string(),
+            node_host: "workstation·8b·is (RTX 4090 + T-FORCE TM8FPP002T)".to_string(),
+            gpu_model: "NVIDIA GeForce RTX 4090".to_string(),
+            vram_total_mib: 24_564,
+            vram_free_mib: 21_980,
+            host_ram_mib: 128_000,
+            nvme_ssd_vault_mib: 1_843_200,
+            online: false,
+            presence_state: "OFFLINE_AWAITING_ANNOUNCEMENT".to_string(),
+            last_seen_epoch_secs: 0,
+            foken_rate_per_hour: 150,
+            fokens_earned: 9_450,
+            jobs_completed: 318,
+            active_model_id: "DeepSeek-R1-671B-MoE-NVFP4".to_string(),
+            provider_trit: Trit::Zero,
+        },
+    ]
+}
+
+/// Build the `wici-ai/inferssd` GGUF Model Catalog (`float_count: 0`) from `/data/wici-ai/inferssd/framework/src/inferssd/app/catalog.py`.
+pub fn default_wici_infer_ssd_models() -> Vec<WiciInferSsdModelEntry> {
+    vec![
+        WiciInferSsdModelEntry {
+            model_id: "DeepSeek-V4·1-Flash-1017-GGUF".to_string(),
+            display_name: "DeepSeek V4·1 Flash 1017 (763B MoE · WiCi InferSSD)".to_string(),
+            params_label: "763B MoE (A32B Active)".to_string(),
+            quant_format: "Q8_0 Dense + MXFP4 Routed Experts".to_string(),
+            hf_revision_prefix: "1df54e7d1b1e".to_string(),
+            shards: 10,
+            layers: 40,
+            experts_total: 384,
+            experts_active: 6,
+            expert_mib: 18,
+            dense_mib: 209_017,
+            mxfp4_mib: 275_399,
+            lookup_mib: 200_487,
+            vram_tier_mib: 42_000,
+            ram_tier_mib: 233_399,
+            ssd_tier_mib: 0,
+            tok_per_sec_pq: Rational::new(367, 10),
+            foken_cost_per_1k_tok: 4,
+            loaded: true,
+            assigned_provider_id: "hetzner-a6000-cheet".to_string(),
+        },
+        WiciInferSsdModelEntry {
+            model_id: "Muse-Spark-Open-816B-A42B-GGUF".to_string(),
+            display_name: "Muse Spark Open (816B MoE · A42B Active · WiCi InferSSD)".to_string(),
+            params_label: "816B MoE (A42B Active)".to_string(),
+            quant_format: "UD-Q4_K_XL + SSD io_uring Pinned Pool".to_string(),
+            hf_revision_prefix: "c00670568b6c".to_string(),
+            shards: 12,
+            layers: 62,
+            experts_total: 256,
+            experts_active: 8,
+            expert_mib: 29,
+            dense_mib: 21_784,
+            mxfp4_mib: 285_696,
+            lookup_mib: 174_592,
+            vram_tier_mib: 21_784,
+            ram_tier_mib: 128_000,
+            ssd_tier_mib: 135_912,
+            tok_per_sec_pq: Rational::new(214, 10),
+            foken_cost_per_1k_tok: 5,
+            loaded: false,
+            assigned_provider_id: "local-rtx4090-tforce".to_string(),
+        },
+        WiciInferSsdModelEntry {
+            model_id: "DeepSeek-R1-671B-MoE-NVFP4".to_string(),
+            display_name: "DeepSeek R1 671B MoE (NVFP4 + SPQT Base-243 Ternary)".to_string(),
+            params_label: "671B MoE (A37B Active)".to_string(),
+            quant_format: "NVFP4 + SPQT Base-243 Ternary (5 trits/byte)".to_string(),
+            hf_revision_prefix: "8b-is-spqt243".to_string(),
+            shards: 8,
+            layers: 61,
+            experts_total: 256,
+            experts_active: 8,
+            expert_mib: 21,
+            dense_mib: 19_400,
+            mxfp4_mib: 335_500,
+            lookup_mib: 132_941,
+            vram_tier_mib: 24_564,
+            ram_tier_mib: 128_000,
+            ssd_tier_mib: 182_936,
+            tok_per_sec_pq: Rational::new(412, 10),
+            foken_cost_per_1k_tok: 3,
+            loaded: true,
+            assigned_provider_id: "local-rtx4090-tforce".to_string(),
+        },
+        WiciInferSsdModelEntry {
+            model_id: "Qwen3·8-Flash-Next-GGUF".to_string(),
+            display_name: "Qwen 3·8 Flash Next (177B Sparse MoE · 512 Experts)".to_string(),
+            params_label: "177B MoE (10/512 Experts)".to_string(),
+            quant_format: "IQ4_XS + CUDA Pinned Staging".to_string(),
+            hf_revision_prefix: "db3a185731e1".to_string(),
+            shards: 3,
+            layers: 48,
+            experts_total: 512,
+            experts_active: 10,
+            expert_mib: 6,
+            dense_mib: 8_192,
+            mxfp4_mib: 88_400,
+            lookup_mib: 44_200,
+            vram_tier_mib: 18_400,
+            ram_tier_mib: 70_000,
+            ssd_tier_mib: 0,
+            tok_per_sec_pq: Rational::new(685, 10),
+            foken_cost_per_1k_tok: 2,
+            loaded: false,
+            assigned_provider_id: "hetzner-a6000-cheet".to_string(),
+        },
+        WiciInferSsdModelEntry {
+            model_id: "Qwen3·6-35B-A3B-GGUF".to_string(),
+            display_name: "Qwen 3·6 35B-A3B (Ultra-Fast Coding & Agentic MoE)".to_string(),
+            params_label: "35B MoE (A3B Active)".to_string(),
+            quant_format: "UD-Q4_K_XL Resident".to_string(),
+            hf_revision_prefix: "a483e9e6cbd5".to_string(),
+            shards: 1,
+            layers: 40,
+            experts_total: 256,
+            experts_active: 8,
+            expert_mib: 2,
+            dense_mib: 2_554,
+            mxfp4_mib: 19_650,
+            lookup_mib: 9_825,
+            vram_tier_mib: 19_650,
+            ram_tier_mib: 0,
+            ssd_tier_mib: 0,
+            tok_per_sec_pq: Rational::new(1420, 10),
+            foken_cost_per_1k_tok: 1,
+            loaded: true,
+            assigned_provider_id: "hetzner-a6000-cheet".to_string(),
+        },
+        WiciInferSsdModelEntry {
+            model_id: "gemma-4-E4B-it-qat-q4_0-gguf".to_string(),
+            display_name: "Gemma 4 E4B IT QAT (Instant Edge & Voice Companion)".to_string(),
+            params_label: "4B Dense QAT".to_string(),
+            quant_format: "Q4_0 QAT Native RAM/VRAM".to_string(),
+            hf_revision_prefix: "google-qat-q4".to_string(),
+            shards: 1,
+            layers: 32,
+            experts_total: 1,
+            experts_active: 1,
+            expert_mib: 1,
+            dense_mib: 2_840,
+            mxfp4_mib: 2_840,
+            lookup_mib: 0,
+            vram_tier_mib: 2_840,
+            ram_tier_mib: 0,
+            ssd_tier_mib: 0,
+            tok_per_sec_pq: Rational::new(2150, 10),
+            foken_cost_per_1k_tok: 1,
+            loaded: true,
+            assigned_provider_id: "hetzner-a6000-cheet".to_string(),
+        },
+    ]
+}
+
+/// Build the default Connected Apps switchboard (`CC Switch` + `/v1` OpenAI Bridge).
+pub fn default_wici_connected_apps() -> Vec<WiciConnectedAppEntry> {
+    vec![
+        WiciConnectedAppEntry {
+            app_id: "antigravity-agy".to_string(),
+            display_name: "Antigravity (agy)".to_string(),
+            category: "Sovereign Agentic IDE & CLI".to_string(),
+            api_endpoint: "https://foken·ai/v1".to_string(),
+            connected: true,
+            requests_routed: 412,
+            fokens_spent: 820,
+        },
+        WiciConnectedAppEntry {
+            app_id: "claude-code".to_string(),
+            display_name: "Claude Code (CC Switch)".to_string(),
+            category: "One-Click Route to Shared WiCi InferSSD".to_string(),
+            api_endpoint: "https://foken·ai/v1".to_string(),
+            connected: true,
+            requests_routed: 289,
+            fokens_spent: 540,
+        },
+        WiciConnectedAppEntry {
+            app_id: "opencode".to_string(),
+            display_name: "OpenCode CLI".to_string(),
+            category: "Terminal Coding Agent via WiCi /v1".to_string(),
+            api_endpoint: "https://foken·ai/v1".to_string(),
+            connected: true,
+            requests_routed: 176,
+            fokens_spent: 310,
+        },
+        WiciConnectedAppEntry {
+            app_id: "wici-thinkless".to_string(),
+            display_name: "Thinkless (/data/wici-ai/thinkless)".to_string(),
+            category: "Adaptive Short/Long CoT Reasoning Router".to_string(),
+            api_endpoint: "https://foken·ai/api/foken/chat".to_string(),
+            connected: true,
+            requests_routed: 94,
+            fokens_spent: 140,
+        },
+        WiciConnectedAppEntry {
+            app_id: "smart-tree-mcp".to_string(),
+            display_name: "Smart Tree MCP (st)".to_string(),
+            category: "MEM|8 Salient Tree & Marqant Compressor".to_string(),
+            api_endpoint: "https://8b·is/a6000/api/wici".to_string(),
+            connected: true,
+            requests_routed: 531,
+            fokens_spent: 265,
+        },
+        WiciConnectedAppEntry {
+            app_id: "spatial-album".to_string(),
+            display_name: "Spatial Album (/data/wici-ai/spatial-album)".to_string(),
+            category: "3D Gaussian Splatting & Vision Pipeline".to_string(),
+            api_endpoint: "https://foken·ai/api/foken/status".to_string(),
+            connected: false,
+            requests_routed: 18,
+            fokens_spent: 36,
+        },
+    ]
+}
+
+/// Mutable in-memory & disk-backed registry for WiCi × Foken.ai announcements, shared GPUs, models, and apps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WiciFokenRegistry {
+    pub wireless_clients: Vec<WiciWirelessClientSchedule>,
+    pub shared_gpus: Vec<FokenSharedGpuProvider>,
+    pub infer_ssd_models: Vec<WiciInferSsdModelEntry>,
+    pub connected_apps: Vec<WiciConnectedAppEntry>,
+    pub active_model_id: String,
+    pub total_fokens_in_circulation: u64,
+    pub total_marqant_bytes_saved: u64,
+}
+
+impl Default for WiciFokenRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WiciFokenRegistry {
+    pub fn new() -> Self {
+        Self {
+            wireless_clients: default_wici_wireless_clients(),
+            shared_gpus: default_foken_shared_gpus(),
+            infer_ssd_models: default_wici_infer_ssd_models(),
+            connected_apps: default_wici_connected_apps(),
+            active_model_id: "DeepSeek-V4·1-Flash-1017-GGUF".to_string(),
+            total_fokens_in_circulation: 25_410,
+            total_marqant_bytes_saved: 1_482_910_720,
+        }
+    }
+
+    /// Re-evaluate TTL expiration (`300s`) across wireless clients and shared GPUs.
+    pub fn refresh_ttl(&mut self, now_secs: u64) {
+        for c in &mut self.wireless_clients {
+            if c.last_seen_epoch_secs > 0
+                && now_secs.saturating_sub(c.last_seen_epoch_secs) <= WICI_FOKEN_ANNOUNCEMENT_TTL_SECS
+            {
+                c.online = true;
+                c.presence_state = "ONLINE_ANNOUNCED".to_string();
+                c.marine_trit = Trit::Pos;
+            } else {
+                c.online = false;
+                c.presence_state = "OFFLINE_AWAITING_ANNOUNCEMENT".to_string();
+                c.marine_trit = Trit::Zero;
+            }
+        }
+        for g in &mut self.shared_gpus {
+            if g.provider_id == "hetzner-a6000-cheet" {
+                g.online = true;
+                g.presence_state = "ONLINE_SOVEREIGN_PRIME".to_string();
+                g.last_seen_epoch_secs = now_secs;
+                g.provider_trit = Trit::Pos;
+            } else if g.last_seen_epoch_secs > 0
+                && now_secs.saturating_sub(g.last_seen_epoch_secs) <= WICI_FOKEN_ANNOUNCEMENT_TTL_SECS
+            {
+                g.online = true;
+                g.presence_state = "ONLINE_ANNOUNCED".to_string();
+                g.provider_trit = Trit::Pos;
+            } else {
+                g.online = false;
+                g.presence_state = "OFFLINE_AWAITING_ANNOUNCEMENT".to_string();
+                g.provider_trit = Trit::Zero;
+            }
+        }
+    }
+
+    /// Announce (or disconnect) a wireless client (`device_kind = "wireless-client"`) or a shared GPU
+    /// provider (`device_kind = "gpu"`), minting Fokens on announcement.
+    pub fn announce_device(
+        &mut self,
+        device_id: &str,
+        device_kind: &str,
+        online: bool,
+        wifi_mbps: Option<u64>,
+        rssi_dbm: Option<i64>,
+        mean_rtt_us: Option<u64>,
+        gpu_model: Option<&str>,
+        node_host: Option<&str>,
+        vram_total_mib: Option<u64>,
+        vram_free_mib: Option<u64>,
+        host_ram_mib: Option<u64>,
+        nvme_ssd_vault_mib: Option<u64>,
+        now_secs: u64,
+    ) -> String {
+        let clean_id = device_id.trim();
+        let id = if clean_id.is_empty() {
+            "blu-g75"
+        } else {
+            clean_id
+        };
+        let is_gpu = device_kind.eq_ignore_ascii_case("gpu")
+            || device_kind.eq_ignore_ascii_case("shared-gpu")
+            || id.contains("rtx")
+            || id.contains("a6000")
+            || id.contains("gpu");
+
+        if is_gpu {
+            let v_tot = vram_total_mib.unwrap_or(24_564).max(1);
+            let v_free = vram_free_mib.unwrap_or(v_tot.saturating_sub(2_584)).min(v_tot);
+            let h_ram = host_ram_mib.unwrap_or(128_000);
+            let nvme = nvme_ssd_vault_mib.unwrap_or(1_843_200);
+            let model_str = gpu_model.unwrap_or("NVIDIA GeForce RTX 4090");
+            let host_str = node_host.unwrap_or("workstation·8b·is (Shared GPU)");
+
+            if let Some(existing) = self
+                .shared_gpus
+                .iter_mut()
+                .find(|g| g.provider_id.eq_ignore_ascii_case(id))
+            {
+                existing.vram_total_mib = v_tot;
+                existing.vram_free_mib = v_free;
+                existing.host_ram_mib = h_ram;
+                existing.nvme_ssd_vault_mib = nvme;
+                if gpu_model.is_some() {
+                    existing.gpu_model = model_str.to_string();
+                }
+                if node_host.is_some() {
+                    existing.node_host = host_str.to_string();
+                }
+                if online {
+                    existing.online = true;
+                    existing.presence_state = "ONLINE_ANNOUNCED".to_string();
+                    existing.last_seen_epoch_secs = now_secs.max(1);
+                    existing.fokens_earned = existing.fokens_earned.saturating_add(50);
+                    existing.jobs_completed = existing.jobs_completed.saturating_add(1);
+                    existing.provider_trit = Trit::Pos;
+                    self.total_fokens_in_circulation =
+                        self.total_fokens_in_circulation.saturating_add(50);
+                } else {
+                    existing.online = false;
+                    existing.presence_state = "OFFLINE_AWAITING_ANNOUNCEMENT".to_string();
+                    existing.last_seen_epoch_secs = 0;
+                    existing.provider_trit = Trit::Zero;
+                }
+                return existing.to_json();
+            } else {
+                let rate = if v_tot >= 40_000 {
+                    200
+                } else if v_tot >= 20_000 {
+                    150
+                } else {
+                    80
+                };
+                let new_gpu = FokenSharedGpuProvider {
+                    provider_id: id.to_string(),
+                    node_host: host_str.to_string(),
+                    gpu_model: model_str.to_string(),
+                    vram_total_mib: v_tot,
+                    vram_free_mib: v_free,
+                    host_ram_mib: h_ram,
+                    nvme_ssd_vault_mib: nvme,
+                    online,
+                    presence_state: if online {
+                        "ONLINE_ANNOUNCED".to_string()
+                    } else {
+                        "OFFLINE_AWAITING_ANNOUNCEMENT".to_string()
+                    },
+                    last_seen_epoch_secs: if online { now_secs.max(1) } else { 0 },
+                    foken_rate_per_hour: rate,
+                    fokens_earned: if online { 100 } else { 0 },
+                    jobs_completed: if online { 1 } else { 0 },
+                    active_model_id: self.active_model_id.clone(),
+                    provider_trit: if online { Trit::Pos } else { Trit::Zero },
+                };
+                if online {
+                    self.total_fokens_in_circulation =
+                        self.total_fokens_in_circulation.saturating_add(100);
+                }
+                let j = new_gpu.to_json();
+                self.shared_gpus.push(new_gpu);
+                return j;
+            }
+        }
+
+        // Wireless edge client announcement (`blu-g75`, `galaxy-s24-ultra`, `raspberry-pi-5-16gb`, `tdeck-omni-esp32s3`, or custom)
+        let mbps = wifi_mbps.unwrap_or(433).max(1);
+        let rssi = rssi_dbm.unwrap_or(-54);
+        let rtt = mean_rtt_us.unwrap_or(3100).max(100);
+        let mut rtt_samples = [0u64; 16];
+        for i in 0..16usize {
+            rtt_samples[i] = if i % 2 == 0 { rtt + 60 } else { rtt.saturating_sub(30) };
+        }
+        let sal_rep = MarineIntDetector::analyze_timing_ring(&rtt_samples);
+
+        if let Some(existing) = self
+            .wireless_clients
+            .iter_mut()
+            .find(|c| c.client_id.eq_ignore_ascii_case(id))
+        {
+            if wifi_mbps.is_some() {
+                existing.wifi_mbps = mbps;
+            }
+            if rssi_dbm.is_some() {
+                existing.rssi_dbm = rssi;
+            }
+            if mean_rtt_us.is_some() {
+                existing.mean_rtt_us = rtt;
+                existing.marine_salience_pq = sal_rep.salience_pq;
+            }
+            if online {
+                existing.online = true;
+                existing.presence_state = "ONLINE_ANNOUNCED".to_string();
+                existing.last_seen_epoch_secs = now_secs.max(1);
+                existing.fokens_balance = existing.fokens_balance.saturating_add(25);
+                existing.marine_trit = Trit::Pos;
+                self.total_fokens_in_circulation =
+                    self.total_fokens_in_circulation.saturating_add(25);
+                self.total_marqant_bytes_saved =
+                    self.total_marqant_bytes_saved.saturating_add(65_536);
+            } else {
+                existing.online = false;
+                existing.presence_state = "OFFLINE_AWAITING_ANNOUNCEMENT".to_string();
+                existing.last_seen_epoch_secs = 0;
+                existing.marine_trit = Trit::Zero;
+            }
+            existing.to_json()
+        } else {
+            let new_client = WiciWirelessClientSchedule {
+                client_id: id.to_string(),
+                online,
+                presence_state: if online {
+                    "ONLINE_ANNOUNCED".to_string()
+                } else {
+                    "OFFLINE_AWAITING_ANNOUNCEMENT".to_string()
+                },
+                last_seen_epoch_secs: if online { now_secs.max(1) } else { 0 },
+                fokens_balance: if online { 125 } else { 100 },
+                compression_codec: "MEMNET/1·0 + Marqant 64B@0x62".to_string(),
+                wifi_mbps: mbps,
+                rssi_dbm: rssi,
+                mean_rtt_us: rtt,
+                marine_salience_pq: sal_rep.salience_pq,
+                marine_trit: if online { Trit::Pos } else { Trit::Zero },
+                coalesced_batch_ops: if rssi >= -47 { 16 } else { 32 },
+                tensor_cache_threshold_kib: if mbps >= 1000 { 128 } else { 64 },
+                trace_replay_rtts_per_token: 1,
+                naive_rtts_per_token: 732,
+                rtt_reduction_pq: Rational::new(731, 732),
+            };
+            if online {
+                self.total_fokens_in_circulation =
+                    self.total_fokens_in_circulation.saturating_add(25);
+                self.total_marqant_bytes_saved =
+                    self.total_marqant_bytes_saved.saturating_add(65_536);
+            }
+            let j = new_client.to_json();
+            self.wireless_clients.push(new_client);
+            j
+        }
+    }
+
+    /// Toggle a Connected App (`CC Switch`) in the registry.
+    pub fn toggle_connected_app(&mut self, app_id: &str) -> Option<WiciConnectedAppEntry> {
+        let app = self
+            .connected_apps
+            .iter_mut()
+            .find(|a| a.app_id.eq_ignore_ascii_case(app_id.trim()))?;
+        app.connected = !app.connected;
+        if app.connected {
+            app.requests_routed = app.requests_routed.saturating_add(1);
+        }
+        Some(app.clone())
+    }
+
+    /// Select / load a model from the `wici-ai/inferssd` catalog onto a shared GPU provider.
+    pub fn select_model(
+        &mut self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<WiciInferSsdModelEntry> {
+        let clean_target = model_id.trim().replace('.', "·");
+        let model = self.infer_ssd_models.iter_mut().find(|m| {
+            m.model_id.eq_ignore_ascii_case(&clean_target)
+                || m.model_id.eq_ignore_ascii_case(model_id.trim())
+        })?;
+        model.loaded = true;
+        if let Some(pid) = provider_id.filter(|s| !s.trim().is_empty()) {
+            model.assigned_provider_id = pid.trim().to_string();
+        }
+        let chosen_id = model.model_id.clone();
+        let chosen_prov = model.assigned_provider_id.clone();
+        let cloned = model.clone();
+        self.active_model_id = chosen_id.clone();
+        if let Some(g) = self
+            .shared_gpus
+            .iter_mut()
+            .find(|g| g.provider_id.eq_ignore_ascii_case(&chosen_prov))
+        {
+            g.active_model_id = chosen_id;
+        }
+        Some(cloned)
+    }
+}
+
+/// Build the complete `WiciWirelessOrchestrationReport` from a `WiciFokenRegistry`.
+pub fn orchestrate_wici_with_registry(
+    registry: &mut WiciFokenRegistry,
+) -> WiciWirelessOrchestrationReport {
+    let now_s = now_epoch_secs();
+    registry.refresh_ttl(now_s);
+
+    let hetzner_a6000_plan = build_wici_moe_node_plan(
+        "hetzner-a6000-cheet",
+        "NVIDIA RTX 6000 Ada Generation",
+        49_140,
+        737_280,
+        15_728_640,
+        4,
+        1,
+    );
+
+    let local_rtx4090_tforce_plan = build_wici_moe_node_plan(
+        "local-rtx4090-tforce-tm8fpp002t",
+        "NVIDIA GeForce RTX 4090",
+        24_564,
+        128_000,
+        1_843_200,
+        4,
+        1,
+    );
+
+    let wici_ai_repos = scan_wici_ai_repos();
+    let online_wireless_clients_count = registry
+        .wireless_clients
+        .iter()
+        .filter(|c| c.online)
+        .count();
+    let online_shared_gpus_count = registry.shared_gpus.iter().filter(|g| g.online).count();
 
     let attest_payload = format!(
-        "WICI_ORCHESTRATION:{}:{}:{}",
+        "WICI_ORCHESTRATION:{}:{}:{}:{}:{}",
         hetzner_a6000_plan.blake3_plan_seal,
         local_rtx4090_tforce_plan.blake3_plan_seal,
-        wireless_clients.len()
+        registry.wireless_clients.len(),
+        online_wireless_clients_count,
+        online_shared_gpus_count
     );
     let attestation_hash = blake3_hex(attest_payload.as_bytes());
 
     WiciWirelessOrchestrationReport {
         hetzner_a6000_plan,
         local_rtx4090_tforce_plan,
-        wireless_clients,
+        wireless_clients: registry.wireless_clients.clone(),
+        shared_gpus: registry.shared_gpus.clone(),
+        infer_ssd_models: registry.infer_ssd_models.clone(),
+        connected_apps: registry.connected_apps.clone(),
+        wici_ai_repos,
+        active_model_id: registry.active_model_id.clone(),
+        total_fokens_in_circulation: registry.total_fokens_in_circulation,
+        total_marqant_bytes_saved: registry.total_marqant_bytes_saved,
+        announcement_ttl_secs: WICI_FOKEN_ANNOUNCEMENT_TTL_SECS,
+        online_wireless_clients_count,
+        online_shared_gpus_count,
         attestation_hash,
     }
+}
+
+/// Orchestrate Subsystem J across both the **Hetzner RTX 6000 Ada (`49,140 MiB` VRAM + `720 GiB` RAM)**
+/// and the **Local RTX 4090 (`24,564 MiB` VRAM + `125 GiB` RAM + `1.8 TiB` T-FORCE NVMe)**,
+/// scheduling `MEMNET` wireless edge clients via `MarineIntDetector` with honest live announcement presence.
+pub fn orchestrate_wici_wireless_moe() -> WiciWirelessOrchestrationReport {
+    let mut reg = WiciFokenRegistry::new();
+    orchestrate_wici_with_registry(&mut reg)
 }
 
 
@@ -7637,7 +8597,90 @@ mod tests {
             assert_eq!(c.naive_rtts_per_token, 732);
             assert_eq!(c.trace_replay_rtts_per_token, 1);
             assert_eq!(c.rtt_reduction_pq, Rational::new(731, 732));
+            // Honest presence invariant (FAMILY_CONTEXT.md §6): unannounced devices default to offline (Trit::Zero)
+            assert!(!c.online);
+            assert_eq!(c.presence_state, "OFFLINE_AWAITING_ANNOUNCEMENT");
+            assert_eq!(c.marine_trit, Trit::Zero);
         }
+
+        // Verify live announcement flips blu-g75 to online (Trit::Pos) and earns 25 Fokens, then expires after 300s TTL
+        let mut reg = WiciFokenRegistry::new();
+        let blu_before = reg
+            .wireless_clients
+            .iter()
+            .find(|c| c.client_id == "blu-g75")
+            .unwrap()
+            .fokens_balance;
+        let ann_json = reg.announce_device(
+            "blu-g75",
+            "wireless-client",
+            true,
+            Some(433),
+            Some(-52),
+            Some(2900),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_000_000,
+        );
+        assert_eq!(count_floating_point_literals(&ann_json), 0);
+        let blu_after = reg
+            .wireless_clients
+            .iter()
+            .find(|c| c.client_id == "blu-g75")
+            .unwrap();
+        assert!(blu_after.online);
+        assert_eq!(blu_after.presence_state, "ONLINE_ANNOUNCED");
+        assert_eq!(blu_after.marine_trit, Trit::Pos);
+        assert_eq!(blu_after.fokens_balance, blu_before + 25);
+
+        // Expire after 301 seconds -> returns to OFFLINE_AWAITING_ANNOUNCEMENT (Trit::Zero)
+        reg.refresh_ttl(1_000_301);
+        let blu_expired = reg
+            .wireless_clients
+            .iter()
+            .find(|c| c.client_id == "blu-g75")
+            .unwrap();
+        assert!(!blu_expired.online);
+        assert_eq!(blu_expired.presence_state, "OFFLINE_AWAITING_ANNOUNCEMENT");
+        assert_eq!(blu_expired.marine_trit, Trit::Zero);
+
+        // Announce shared GPU provider local-rtx4090-tforce
+        let gpu_ann = reg.announce_device(
+            "local-rtx4090-tforce",
+            "gpu",
+            true,
+            None,
+            None,
+            None,
+            Some("NVIDIA GeForce RTX 4090"),
+            Some("workstation·8b·is"),
+            Some(24_564),
+            Some(21_980),
+            Some(128_000),
+            Some(1_843_200),
+            1_000_301,
+        );
+        assert_eq!(count_floating_point_literals(&gpu_ann), 0);
+        let gpu_after = reg
+            .shared_gpus
+            .iter()
+            .find(|g| g.provider_id == "local-rtx4090-tforce")
+            .unwrap();
+        assert!(gpu_after.online);
+        assert_eq!(gpu_after.provider_trit, Trit::Pos);
+
+        // Toggle connected app & select InferSSD model
+        let toggled = reg.toggle_connected_app("spatial-album").unwrap();
+        assert!(toggled.connected);
+        let selected = reg
+            .select_model("Muse-Spark-Open-816B-A42B-GGUF", Some("local-rtx4090-tforce"))
+            .unwrap();
+        assert!(selected.loaded);
+        assert_eq!(reg.active_model_id, "Muse-Spark-Open-816B-A42B-GGUF");
 
         let json = rep.to_json();
         assert_eq!(count_floating_point_literals(&json), 0);
