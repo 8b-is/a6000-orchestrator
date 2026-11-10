@@ -197,10 +197,10 @@ pub fn collect_status_report(state: &mut A6000OrchestratorState) -> A6000StatusR
             "ALEXIAI Sovereign Offline AI Companion (Loopback Enforced)",
         ),
         (
-            "ollama.service",
+            "st-ollama-context.service",
             11434,
             "/api/tags",
-            "Local GGUF Model Server (cheet-deepseek-v2 16B on RTX 6000 Ada)",
+            "Smart-Tree Sovereign Context Engine (Ollama-Compatible Bridge · MEM|8 + 4gaia PQM + g8t·is)",
         ),
         (
             "wa-s3-catalog.service",

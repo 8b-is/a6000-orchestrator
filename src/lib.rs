@@ -2549,7 +2549,7 @@ pub fn summarize_improver_ring(
     let active_gpu_model = records
         .last()
         .map(|r| r.gpu_model.clone())
-        .unwrap_or_else(|| "cheet-deepseek-v2:16b".to_string());
+        .unwrap_or_else(|| "st-mem8-context:latest".to_string());
     let gpu_vram_resident_mib = vram_used_mib.max(
         records
             .last()
@@ -2802,16 +2802,16 @@ pub fn query_alexiai_gaia_fold(repo_name: &str, symbol: &str) -> String {
     )
 }
 
-/// Query the local Ollama server on `127.0.0.1:11434/api/generate` with `"keep_alive": -1` and
-/// `"options": {"num_ctx": 16384}` so the model remains permanently hot in the RTX 6000 Ada's
-/// `49,140 MiB` VRAM. Overrides `"system"` so `cheet-deepseek-v2:16b` acts as the Sovereign Rust
-/// Kernel Auditor rather than its default chat persona.
+/// Query the Smart-Tree Sovereign Context Engine (`st-ollama-context.service`) on
+/// `127.0.0.1:11434/api/generate` with `"keep_alive": -1` and `"options": {"num_ctx": 32768}`.
+/// Replaces legacy external Ollama with Smart-Tree MEM|8 Wave Context + 4gaia Symplectic PQM +
+/// AlexiAI (:8787) GAIA field folding + g8t.is pure-Rust capsule recommendations.
 /// Returns `(model_name, tokens_generated, eval_duration_ms, sanitized_recommendation, vram_mib)`.
 pub fn query_ollama_gpu_synthesis(
     prompt: &str,
     default_recommendation: &str,
 ) -> (String, u64, u64, String, u64) {
-    let model_name = "cheet-deepseek-v2:16b".to_string();
+    let model_name = "st-mem8-context:latest".to_string();
     let addr = SocketAddr::from(([127, 0, 0, 1], 11434));
     let connect_timeout = Duration::from_millis(300);
 
