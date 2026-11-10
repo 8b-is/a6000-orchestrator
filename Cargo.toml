@@ -1,6 +1,6 @@
 [package]
 name = "a6000-orchestrator"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = [
     "Hue (Christopher Chenoweth) <c@8b.is>",
