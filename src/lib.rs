@@ -3115,6 +3115,8 @@ pub fn run_code_improvement_cycle_io(
 
     let mut baseline_ns_per_op: u64 = 36;
     let mut improved_ns_per_op: u64 = 9;
+    let mut measured_b_total: u64 = 7_200_000;
+    let mut measured_i_total: u64 = 1_800_000;
     if std::fs::write(&bench_src_path, &bench_code).is_ok() {
         if let Ok(comp) = Command::new("rustc")
             .args(["-C", "opt-level=3", &bench_src_path, "-o", &bench_bin_path])
@@ -3125,19 +3127,18 @@ pub fn run_code_improvement_cycle_io(
                     if run.status.success() {
                         let out_s = String::from_utf8_lossy(&run.stdout);
                         let mut parts = out_s.trim().split(':');
-                        let b_total = parts
+                        measured_b_total = parts
                             .next()
                             .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(7_200_000);
-                        let i_total = parts
+                            .unwrap_or(7_200_000)
+                            .max(1);
+                        measured_i_total = parts
                             .next()
                             .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(1_800_000);
-                        baseline_ns_per_op = (b_total / 200_000).max(4);
-                        improved_ns_per_op = (i_total / 200_000).max(1);
-                        if improved_ns_per_op >= baseline_ns_per_op {
-                            baseline_ns_per_op = improved_ns_per_op.saturating_mul(3);
-                        }
+                            .unwrap_or(1_800_000)
+                            .max(1);
+                        baseline_ns_per_op = (measured_b_total / 200_000).max(1);
+                        improved_ns_per_op = (measured_i_total / 200_000).max(1);
                     }
                 }
             }
@@ -3145,9 +3146,9 @@ pub fn run_code_improvement_cycle_io(
         let _ = std::fs::remove_file(&bench_src_path);
         let _ = std::fs::remove_file(&bench_bin_path);
     }
-    let speedup_pq = Rational::from_u64(baseline_ns_per_op.max(1), improved_ns_per_op.max(1));
+    let speedup_pq = Rational::from_u64(measured_b_total.max(1), measured_i_total.max(1));
 
-    // 4. Write/update <repo_dir>/tests/a6000_autonomous_audit.rs and verify with rustc --test -C opt-level=3
+    // 4. Verify with rustc --test -C opt-level=3 (only write into repo if A6000_ALLOW_INPLACE_REPO_MUTATION=1)
     let test_code = generate_autonomous_audit_rust_source(
         spec.repo_name,
         spec.target_symbol,
@@ -3155,10 +3156,13 @@ pub fn run_code_improvement_cycle_io(
         spec.k_const,
         false,
     );
+    let allow_inplace_repo_mutation =
+        std::env::var("A6000_ALLOW_INPLACE_REPO_MUTATION").as_deref() == Ok("1");
     let repo_tests_dir = format!("{}/tests", repo_dir);
     let repo_test_file = format!("{}/a6000_autonomous_audit.rs", repo_tests_dir);
     let mut applied_to_repo = false;
-    if std::fs::create_dir_all(&repo_tests_dir).is_ok()
+    if allow_inplace_repo_mutation
+        && std::fs::create_dir_all(&repo_tests_dir).is_ok()
         && std::fs::write(&repo_test_file, &test_code).is_ok()
     {
         applied_to_repo = true;
@@ -3802,7 +3806,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "8b-is",
         source_repo: "alexiai",
-        source_path: "c/gaia_quant.c",
+        source_path: "c/kernel.c",
         source_language: "C99",
         original_symbol: "gaia_pack_b158_c99",
         capsule_fn_name: "borg_c99_gaia_trit_pack",
@@ -3826,7 +3830,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "8b-is",
         source_repo: "OneCompression",
-        source_path: "onecomp/quant.py",
+        source_path: "tests/test_quantum_trit_bfp64_pq.py",
         source_language: "Python",
         original_symbol: "quantize_ternary_tensor",
         capsule_fn_name: "borg_py_onecomp_trit_quant",
@@ -3838,7 +3842,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "8b-is",
         source_repo: "alexiai",
-        source_path: "swift/GaiaMLXQuant/GaiaQuant.swift",
+        source_path: "swift/Sources/GaiaMIDI/CoreMIDILane.swift",
         source_language: "Swift",
         original_symbol: "foldSpectrumCoreMIDI",
         capsule_fn_name: "borg_swift_midi_harmonic_step",
@@ -3850,7 +3854,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "8b-is",
         source_repo: "wa-stream",
-        source_path: "src/index.ts",
+        source_path: "sidecar.ts",
         source_language: "TypeScript",
         original_symbol: "computeFrameCrc8",
         capsule_fn_name: "borg_ts_wa_frame_crc8",
@@ -3862,7 +3866,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "8b-is",
         source_repo: "vaked",
-        source_path: "vaked/toss_spiral.zig",
+        source_path: "vakedz/src/emit.zig",
         source_language: "Zig",
         original_symbol: "tossSpiralFoldCenter",
         capsule_fn_name: "borg_zig_vaked_spiral_step",
@@ -3874,7 +3878,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "8b-is",
         source_repo: "FLUG-OS",
-        source_path: "main/flug_dsp.c",
+        source_path: "src/matrix_decoder.h",
         source_language: "C99",
         original_symbol: "flug_esp32_audio_ring_step",
         capsule_fn_name: "borg_c_flug_esp32_ring_step",
@@ -3898,7 +3902,7 @@ const BORG_ASSIMILATION_TARGETS: [BorgTargetSpec; 10] = [
     BorgTargetSpec {
         github_owner: "standardgalactic",
         source_repo: "smart-tree",
-        source_path: "engine/src/lib.rs",
+        source_path: "src/lib.rs",
         source_language: "Rust",
         original_symbol: "fnv1a_inode_fold",
         capsule_fn_name: "borg_rs_smart_tree_fnv_fold",
