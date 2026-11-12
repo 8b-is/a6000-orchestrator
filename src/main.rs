@@ -30,6 +30,10 @@ pub struct A6000OrchestratorState {
     pub last_domains_report: Option<LumisstDomainReconcileReport>,
     pub commitments: Vec<NormativeCommitment>,
     pub wici_foken_registry: WiciFokenRegistry,
+    pub watchdog_check_counter: u64,
+    pub watchdog_heal_counter: u64,
+    pub watchdog_heal_ring: RingBuffer<WatchdogHealEvent, 64>,
+    pub last_watchdog_report: Option<WatchdogStatusReport>,
 }
 
 impl A6000OrchestratorState {
@@ -124,6 +128,10 @@ impl A6000OrchestratorState {
             last_domains_report: None,
             commitments,
             wici_foken_registry,
+            watchdog_check_counter: 0,
+            watchdog_heal_counter: 0,
+            watchdog_heal_ring: RingBuffer::new(),
+            last_watchdog_report: None,
         };
 
         let (_, sample) = query_nvidia_smi_tick(1);
@@ -1366,6 +1374,38 @@ pub fn render_domains_json(
     json
 }
 
+pub fn render_watchdog_json(
+    state: &mut A6000OrchestratorState,
+    force_check: bool,
+    auto_heal: bool,
+    force_target: Option<&str>,
+) -> String {
+    if !force_check && force_target.is_none() {
+        if let Some(ref cached) = state.last_watchdog_report {
+            return cached.to_json();
+        }
+    }
+    state.watchdog_check_counter = state.watchdog_check_counter.saturating_add(1);
+    let rep = run_watchdog_check_and_heal_pass(
+        state.watchdog_check_counter,
+        &mut state.watchdog_heal_counter,
+        &mut state.watchdog_heal_ring,
+        auto_heal,
+        force_target,
+    );
+    state.c64_page.write_record(&format!(
+        "WATCHDOG_K:CHECK={}:MODE={}:HEALTHY={}/{}:HEALS={}",
+        rep.total_checks_run,
+        rep.mode,
+        rep.healthy_targets_count,
+        rep.total_targets_count,
+        rep.total_auto_heals_triggered
+    ));
+    let json = rep.to_json();
+    state.last_watchdog_report = Some(rep);
+    json
+}
+
 pub fn render_commitments_json(
     state: &A6000OrchestratorState,
     force_blocked_continuation: bool,
@@ -2428,6 +2468,7 @@ pub fn render_command_deck_html() -> &'static str {
       <span class="badge">Namecheap lumisst + ns1..ns4·i1·is Reconciler</span>
       <span class="badge">MEM|8 16-Byte Normative Commitment Kernel</span>
       <span class="badge badge-green">WiCi Wireless GPU &amp; DeepSeek-671B MoE (A6000 + RTX 4090)</span>
+      <span class="badge badge-green">Subsystem K · Continuous Fleet Availability Watchdog &amp; Auto-Fix Engine</span>
     </div>
   </header>
 
@@ -2449,8 +2490,23 @@ pub fn render_command_deck_html() -> &'static str {
       <button class="btn-amber" onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=true')">[12] Announce blu-g75 Online (+25 FKN)</button>
       <button onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=false')">[13] Set blu-g75 Offline [0]</button>
       <button class="btn-teal" onclick="window.location.href='/a6000/foken'">[14] Open Foken·ai × WiCi InferSSD Dashboard</button>
+      <button class="btn-teal" onclick="runAction('/a6000/api/watchdog/check')">[15] Run Fleet Availability Watchdog Check + Auto-Fix</button>
+      <button class="btn-amber" onclick="runAction('/a6000/api/watchdog/heal')">[16] Force Auto-Fix Playbook Pass</button>
     </div>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM K · SOVEREIGN FLEET AVAILABILITY WATCHDOG &amp; AUTO-FIX ENGINE (30s CADENCE · 332 REPOS SYNCED)</h2>
+    <div id="watchdog-summary">Loading Subsystem K Continuous Server Availability Watchdog &amp; Auto-Fix status...</div>
+    <table id="watchdog-table">
+      <thead>
+        <tr>
+          <th>Target ID</th><th>Node</th><th>Service</th><th>Port</th><th>Status / Detail</th><th>RTT (us)</th><th>Auto-Fix Playbook</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
@@ -2604,6 +2660,26 @@ async function refreshAll() {
       sbody.appendChild(tr);
     }
     document.getElementById('c64-log').textContent = (st.c64_ring.recent_events || []).join('\n');
+
+    const wd = await fetchJson('/a6000/api/watchdog', 'GET');
+    document.getElementById('watchdog-summary').innerHTML =
+      '<div><b>Watchdog Mode:</b> <span class="' + tritClass(wd.overall_trit) + '">' + wd.mode + ' (' + wd.overall_trit_glyph + ')</span> · Availability Ratio (p/q): <b>' + wd.availability_ratio_pq + '</b> (' + wd.healthy_targets_count + ' / ' + wd.total_targets_count + ' targets healthy) · Cadence: <b>' + wd.interval_secs + 's</b> · Total Checks: <b>' + wd.total_checks_run + '</b></div>' +
+      '<div><b>Autonomous Self-Heals:</b> Triggered = <b>' + wd.total_auto_heals_triggered + '</b> · Verified Fixed Ratio (p/q) = <b>' + wd.heal_success_ratio_pq + '</b> · Stale SSH Control Sockets Cleaned = <b>' + wd.stale_ssh_sockets_cleaned + '</b> · Synced 8b-is Fleet Repos = <b>' + wd.repos_synced_count + ' / 332</b> · BLAKE3 Attestation = <code>' + (wd.attestation_hash || '').slice(0, 16) + '</code></div>';
+    const wdbody = document.querySelector('#watchdog-table tbody');
+    wdbody.innerHTML = '';
+    for (const t of (wd.targets || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><b>' + t.target_id + '</b></td>' +
+        '<td>' + t.node_label + ' (' + t.node_ip + ')</td>' +
+        '<td><code>' + t.service_name + '</code></td>' +
+        '<td>:' + t.port + '</td>' +
+        '<td class="' + tritClass(t.status_trit) + '"><b>' + t.detail + '</b></td>' +
+        '<td>' + t.latency_us + ' us</td>' +
+        '<td><code>' + t.auto_fix_command + '</code></td>' +
+        '<td class="' + tritClass(t.status_trit) + '">' + t.status_trit_glyph + ' (' + t.status_trit + ')</td>';
+      wdbody.appendChild(tr);
+    }
 
     const wc = await fetchJson('/a6000/api/wici', 'GET');
     const ha = wc.hetzner_a6000_plan;
@@ -3252,6 +3328,31 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
             let json = execute_wici_foken_chat(&mut guard, raw_path, req_body);
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
+        ("GET", "/a6000/api/watchdog")
+        | ("GET", "/api/watchdog")
+        | ("GET", "/a6000/api/watchdog/status")
+        | ("GET", "/api/watchdog/status") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = render_watchdog_json(&mut guard, false, true, None);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/watchdog/check") | (_, "/api/watchdog/check") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = render_watchdog_json(&mut guard, true, true, None);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/watchdog/heal") | (_, "/api/watchdog/heal") => {
+            let target = extract_query_param(raw_path, "target")
+                .or_else(|| extract_json_string_field(req_body, "target"));
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = render_watchdog_json(
+                &mut guard,
+                true,
+                true,
+                Some(target.as_deref().unwrap_or("cheet-st-ollama-context-11434")),
+            );
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
         _ => (
             "HTTP/1.1 404 Not Found",
             "application/json; charset=utf-8",
@@ -3310,11 +3411,16 @@ fn spawn_continuous_improver_thread(shared: Arc<Mutex<A6000OrchestratorState>>) 
                 let sync_rep = sync_github_owner_io("8b-is", 25);
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.last_borg_sync_report = Some(sync_rep);
+                let _ = render_watchdog_json(&mut guard, true, true, None);
             }
         }
 
         loop {
-            thread::sleep(std::time::Duration::from_secs(SUBSYSTEM_F_INTERVAL_SECS));
+            thread::sleep(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+            {
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = render_watchdog_json(&mut guard, true, true, None);
+            }
             let (cid, nonce, bid, bnonce) = {
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.improver_cycle_counter = guard.improver_cycle_counter.saturating_add(1);
@@ -3411,6 +3517,23 @@ fn main() {
         "wici" | "wici-moe" => {
             let rep = orchestrate_wici_wireless_moe();
             println!("{}", rep.to_json());
+            return;
+        }
+        "watchdog" | "watchdog-check" => {
+            println!("{}", render_watchdog_json(&mut init_state, true, true, None));
+            return;
+        }
+        "watchdog-heal" | "heal" => {
+            let target = args.get(2).map(String::as_str);
+            println!(
+                "{}",
+                render_watchdog_json(
+                    &mut init_state,
+                    true,
+                    true,
+                    Some(target.unwrap_or("cheet-st-ollama-context-11434"))
+                )
+            );
             return;
         }
         "commitment-transition" => {
@@ -3654,6 +3777,15 @@ mod tests {
             0,
             "Float literal found in chat_json: {}",
             chat_json
+        );
+
+        let watchdog_json = render_watchdog_json(&mut state, true, false, None);
+        assert!(watchdog_json.contains("\"subsystem\":\"K_sovereign_fleet_watchdog_and_auto_healer\""));
+        assert_eq!(
+            count_floating_point_literals(&watchdog_json),
+            0,
+            "Float literal found in watchdog_json: {}",
+            watchdog_json
         );
     }
 }
