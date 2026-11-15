@@ -3,7 +3,9 @@
 //! Centered on `49.13.101.247` (`cheet.is` · `a6000.8b.is` · `g6k2.nue.8s.is` · RTX 6000 Ada).
 
 use a6000_orchestrator::*;
-use std::io::{Read, Write};
+mod http;
+mod watchdog_control;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -30,6 +32,10 @@ pub struct A6000OrchestratorState {
     pub last_domains_report: Option<LumisstDomainReconcileReport>,
     pub commitments: Vec<NormativeCommitment>,
     pub wici_foken_registry: WiciFokenRegistry,
+    pub watchdog_check_counter: u64,
+    pub watchdog_heal_counter: u64,
+    pub watchdog_heal_ring: RingBuffer<WatchdogHealEvent, 64>,
+    pub last_watchdog_report: Option<WatchdogStatusReport>,
 }
 
 impl A6000OrchestratorState {
@@ -124,6 +130,10 @@ impl A6000OrchestratorState {
             last_domains_report: None,
             commitments,
             wici_foken_registry,
+            watchdog_check_counter: 0,
+            watchdog_heal_counter: 0,
+            watchdog_heal_ring: RingBuffer::new(),
+            last_watchdog_report: None,
         };
 
         let (_, sample) = query_nvidia_smi_tick(1);
@@ -1366,6 +1376,39 @@ pub fn render_domains_json(
     json
 }
 
+pub fn render_watchdog_json(
+    state: &mut A6000OrchestratorState,
+    force_check: bool,
+    auto_heal: bool,
+    force_target: Option<&str>,
+) -> String {
+    if !force_check && force_target.is_none() {
+        if let Some(ref cached) = state.last_watchdog_report {
+            return cached.to_json();
+        }
+        return "{\"ok\":true,\"state\":\"not_checked\",\"targets\":[]}".to_owned();
+    }
+    state.watchdog_check_counter = state.watchdog_check_counter.saturating_add(1);
+    let rep = run_watchdog_check_and_heal_pass(
+        state.watchdog_check_counter,
+        &mut state.watchdog_heal_counter,
+        &mut state.watchdog_heal_ring,
+        auto_heal,
+        force_target,
+    );
+    state.c64_page.write_record(&format!(
+        "WATCHDOG_K:CHECK={}:MODE={}:HEALTHY={}/{}:HEALS={}",
+        rep.total_checks_run,
+        rep.mode,
+        rep.healthy_targets_count,
+        rep.total_targets_count,
+        rep.total_auto_heals_triggered
+    ));
+    let json = rep.to_json();
+    state.last_watchdog_report = Some(rep);
+    json
+}
+
 pub fn render_commitments_json(
     state: &A6000OrchestratorState,
     force_blocked_continuation: bool,
@@ -1821,7 +1864,7 @@ pub fn execute_wici_foken_chat(
         .or_else(|| extract_json_string_field(req_body, "prompt"))
         .or_else(|| extract_json_string_field(req_body, "content"))
         .unwrap_or_else(|| {
-            "Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts from NVMe SSD with zero floats".to_string()
+            "Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts from NVMe SSD".to_string()
         });
     let active_model = state.wici_foken_registry.active_model_id.clone();
     let default_reply = format!(
@@ -2010,7 +2053,6 @@ pub fn render_foken_wici_dashboard_html() -> &'static str {
       Workstation RTX 4090 (24564 MiB VRAM + 125 GiB RAM + 1843200 MiB T-FORCE NVMe) + /data/wici-ai/inferssd
     </div>
     <div class="badge-bar">
-      <span class="badge badge-green">Zero-Float Law (float_count = 0)</span>
       <span class="badge badge-gold">Foken Shared GPU Economy (Earn &amp; Spend FKN)</span>
       <span class="badge badge-green">Honest Live Presence (300s Announcement TTL)</span>
       <span class="badge">wici-ai/inferssd (763B DeepSeek V4·1 &amp; 816B Muse Spark)</span>
@@ -2129,7 +2171,7 @@ pub fn render_foken_wici_dashboard_html() -> &'static str {
   <div class="card">
     <h2>5 · LOCAL ASSISTANT CHAT &amp; LIVE ssd·place·layer / io_uring EXPERT TELEMETRY</h2>
     <div class="btn-row">
-      <input type="text" id="chat-prompt" value="Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts over Wi-Fi with zero floats" />
+      <input type="text" id="chat-prompt" value="Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts over Wi-Fi" />
       <button class="btn-teal" onclick="sendFokenChat()">Run Shared GPU Inference (4 FKN)</button>
     </div>
     <pre id="chat-output">Ready — send a prompt above or click any model/device action to inspect live ssd·place·layer &amp; Foken ledger telemetry.</pre>
@@ -2422,12 +2464,12 @@ pub fn render_command_deck_html() -> &'static str {
     </div>
     <div class="badge-bar">
       <span class="badge badge-green">100% Pure Rust · #![forbid(unsafe_code)]</span>
-      <span class="badge badge-green">Strict 8b·is No-Float Law (float_count = 0)</span>
       <span class="badge badge-green">RTX 6000 Ada Resident (keep_alive = -1)</span>
       <span class="badge">Hetzner VLAN 4010 (vSwitch #71596 · 160 TB Link)</span>
       <span class="badge">Namecheap lumisst + ns1..ns4·i1·is Reconciler</span>
       <span class="badge">MEM|8 16-Byte Normative Commitment Kernel</span>
       <span class="badge badge-green">WiCi Wireless GPU &amp; DeepSeek-671B MoE (A6000 + RTX 4090)</span>
+      <span class="badge badge-green">Subsystem K · Continuous Fleet Availability Watchdog &amp; Auto-Fix Engine</span>
     </div>
   </header>
 
@@ -2449,8 +2491,24 @@ pub fn render_command_deck_html() -> &'static str {
       <button class="btn-amber" onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=true')">[12] Announce blu-g75 Online (+25 FKN)</button>
       <button onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=false')">[13] Set blu-g75 Offline [0]</button>
       <button class="btn-teal" onclick="window.location.href='/a6000/foken'">[14] Open Foken·ai × WiCi InferSSD Dashboard</button>
+      <button class="btn-teal" onclick="runWatchdogAction('/a6000/api/watchdog/check')">[15] Check Fleet Availability</button>
+      <button class="btn-amber" onclick="runWatchdogAction('/a6000/api/watchdog/heal')">[16] Run Recovery Playbook</button>
     </div>
+    <label>Watchdog control key <input id="watchdog-control-key" type="password" autocomplete="off" minlength="32"></label>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
+  </div>
+
+  <div class="card" style="margin-bottom: 16px;">
+    <h2>SUBSYSTEM K · SOVEREIGN FLEET AVAILABILITY WATCHDOG &amp; AUTO-FIX ENGINE (30s CADENCE · 332 REPOS SYNCED)</h2>
+    <div id="watchdog-summary">Loading Subsystem K Continuous Server Availability Watchdog &amp; Auto-Fix status...</div>
+    <table id="watchdog-table">
+      <thead>
+        <tr>
+          <th>Target ID</th><th>Node</th><th>Service</th><th>Port</th><th>Status / Detail</th><th>RTT (us)</th><th>Auto-Fix Playbook</th><th>Trit</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <div class="card" style="margin-bottom: 16px;">
@@ -2574,6 +2632,16 @@ async function fetchJson(path, method) {
   return await res.json();
 }
 
+async function runWatchdogAction(path) {
+  const input = document.getElementById('watchdog-control-key');
+  const output = document.getElementById('action-output');
+  if (input.value.length < 32) { output.textContent = 'Enter your watchdog control key first.'; return; }
+  try {
+    const response = await fetch(path, {method: 'POST', headers: {'Authorization': 'Bearer ' + input.value}});
+    output.textContent = await response.text();
+  } catch (error) { output.textContent = String(error); }
+  finally { input.value = ''; }
+}
 async function runAction(path) {
   const out = document.getElementById('action-output');
   out.textContent = 'Executing ' + path + ' on 49.13.101.247 (RTX 6000 Ada)...';
@@ -2604,6 +2672,26 @@ async function refreshAll() {
       sbody.appendChild(tr);
     }
     document.getElementById('c64-log').textContent = (st.c64_ring.recent_events || []).join('\n');
+
+    const wd = await fetchJson('/a6000/api/watchdog', 'GET');
+    document.getElementById('watchdog-summary').innerHTML =
+      '<div><b>Watchdog Mode:</b> <span class="' + tritClass(wd.overall_trit) + '">' + wd.mode + ' (' + wd.overall_trit_glyph + ')</span> · Availability Ratio (p/q): <b>' + wd.availability_ratio_pq + '</b> (' + wd.healthy_targets_count + ' / ' + wd.total_targets_count + ' targets healthy) · Cadence: <b>' + wd.interval_secs + 's</b> · Total Checks: <b>' + wd.total_checks_run + '</b></div>' +
+      '<div><b>Autonomous Self-Heals:</b> Triggered = <b>' + wd.total_auto_heals_triggered + '</b> · Verified Fixed Ratio (p/q) = <b>' + wd.heal_success_ratio_pq + '</b> · Stale SSH Control Sockets Cleaned = <b>' + wd.stale_ssh_sockets_cleaned + '</b> · Synced 8b-is Fleet Repos = <b>' + wd.repos_synced_count + ' / 332</b> · BLAKE3 Attestation = <code>' + (wd.attestation_hash || '').slice(0, 16) + '</code></div>';
+    const wdbody = document.querySelector('#watchdog-table tbody');
+    wdbody.innerHTML = '';
+    for (const t of (wd.targets || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><b>' + t.target_id + '</b></td>' +
+        '<td>' + t.node_label + ' (' + t.node_ip + ')</td>' +
+        '<td><code>' + t.service_name + '</code></td>' +
+        '<td>:' + t.port + '</td>' +
+        '<td class="' + tritClass(t.status_trit) + '"><b>' + t.detail + '</b></td>' +
+        '<td>' + t.latency_us + ' us</td>' +
+        '<td><code>' + t.auto_fix_command + '</code></td>' +
+        '<td class="' + tritClass(t.status_trit) + '">' + t.status_trit_glyph + ' (' + t.status_trit + ')</td>';
+      wdbody.appendChild(tr);
+    }
 
     const wc = await fetchJson('/a6000/api/wici', 'GET');
     const ha = wc.hetzner_a6000_plan;
@@ -2806,54 +2894,11 @@ fn url_encode_query_val(raw: &str) -> String {
     out
 }
 
-fn read_http_request_bytes(stream: &mut TcpStream) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 4096];
-    let mut header_end: Option<usize> = None;
-    let mut content_length: usize = 0;
-
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let end = pos + 4;
-                        header_end = Some(end);
-                        let hdr_str = String::from_utf8_lossy(&buf[..end]);
-                        for line in hdr_str.lines() {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.trim().eq_ignore_ascii_case("content-length") {
-                                    content_length = v.trim().parse::<usize>().unwrap_or(0).min(16384);
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(end) = header_end {
-                    if buf.len() >= end.saturating_add(content_length) || buf.len() >= 16384 {
-                        break;
-                    }
-                } else if buf.len() >= 16384 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    buf
-}
-
-fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000OrchestratorState>>) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-
-    let raw_bytes = read_http_request_bytes(&mut stream);
-    if raw_bytes.is_empty() {
+fn handle_http_connection(mut stream: TcpStream, raw_bytes: Vec<u8>, state: Arc<Mutex<A6000OrchestratorState>>) {
+    if stream.set_nonblocking(false).is_err() {
         return;
     }
-
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let req_str = String::from_utf8_lossy(&raw_bytes);
     let req_body = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim();
     let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
@@ -2864,7 +2909,19 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
     let raw_path = parts.next().unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
 
+    let configured_token = std::env::var("A6000_WATCHDOG_CONTROL_TOKEN").ok();
+    let control_error = if watchdog_control::is_control_path(path) {
+        watchdog_control::authorize(raw_method, &req_str, configured_token.as_deref()).err()
+    } else {
+        None
+    };
     let (status_line, content_type, body) = match (method, path) {
+        _ if control_error.is_some() => {
+            let reason = control_error.unwrap();
+            let status = if reason == "method_not_allowed" { "HTTP/1.1 405 Method Not Allowed" } else { "HTTP/1.1 403 Forbidden" };
+            (status, "application/json; charset=utf-8", format!("{{\"ok\":false,\"error\":\"{reason}\"}}"))
+        }
+
         ("OPTIONS", _) => (
             "HTTP/1.1 204 No Content",
             "text/plain; charset=utf-8",
@@ -3252,6 +3309,31 @@ fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000Orchestra
             let json = execute_wici_foken_chat(&mut guard, raw_path, req_body);
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
+        ("GET", "/a6000/api/watchdog")
+        | ("GET", "/api/watchdog")
+        | ("GET", "/a6000/api/watchdog/status")
+        | ("GET", "/api/watchdog/status") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = render_watchdog_json(&mut guard, false, false, None);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/watchdog/check") | (_, "/api/watchdog/check") => {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = render_watchdog_json(&mut guard, true, false, None);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        (_, "/a6000/api/watchdog/heal") | (_, "/api/watchdog/heal") => {
+            let target = extract_query_param(raw_path, "target")
+                .or_else(|| extract_json_string_field(req_body, "target"));
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            let json = render_watchdog_json(
+                &mut guard,
+                true,
+                true,
+                Some(target.as_deref().unwrap_or("cheet-st-ollama-context-11434")),
+            );
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
         _ => (
             "HTTP/1.1 404 Not Found",
             "application/json; charset=utf-8",
@@ -3310,11 +3392,18 @@ fn spawn_continuous_improver_thread(shared: Arc<Mutex<A6000OrchestratorState>>) 
                 let sync_rep = sync_github_owner_io("8b-is", 25);
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.last_borg_sync_report = Some(sync_rep);
+                let auto_heal = std::env::var("A6000_WATCHDOG_AUTO_HEAL").is_ok_and(|value| value == "1");
+                let _ = render_watchdog_json(&mut guard, true, auto_heal, None);
             }
         }
 
         loop {
-            thread::sleep(std::time::Duration::from_secs(SUBSYSTEM_F_INTERVAL_SECS));
+            thread::sleep(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS));
+            {
+                let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let auto_heal = std::env::var("A6000_WATCHDOG_AUTO_HEAL").is_ok_and(|value| value == "1");
+                let _ = render_watchdog_json(&mut guard, true, auto_heal, None);
+            }
             let (cid, nonce, bid, bnonce) = {
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.improver_cycle_counter = guard.improver_cycle_counter.saturating_add(1);
@@ -3413,6 +3502,23 @@ fn main() {
             println!("{}", rep.to_json());
             return;
         }
+        "watchdog" | "watchdog-check" => {
+            println!("{}", render_watchdog_json(&mut init_state, true, false, None));
+            return;
+        }
+        "watchdog-heal" | "heal" => {
+            let target = args.get(2).map(String::as_str);
+            println!(
+                "{}",
+                render_watchdog_json(
+                    &mut init_state,
+                    true,
+                    true,
+                    Some(target.unwrap_or("cheet-st-ollama-context-11434"))
+                )
+            );
+            return;
+        }
         "commitment-transition" => {
             let mut path = "/api/a6000/commitments/transition".to_string();
             let mut qp = Vec::new();
@@ -3442,7 +3548,7 @@ fn main() {
     let _ = verify_backup_vaults(&mut init_state);
     let _ = render_domains_json(&mut init_state, true, None, None);
 
-    let bind_addr = std::env::var("A6000_BIND").unwrap_or_else(|_| "0.0.0.0:8790".to_string());
+    let bind_addr = std::env::var("A6000_BIND").unwrap_or_else(|_| "127.0.0.1:8790".to_string());
     let listener = TcpListener::bind(&bind_addr).expect("Failed to bind A6000 orchestrator port");
     println!(
         "[a6000-orchestrator] Listening on http://{} (RTX 6000 Ada · 49140 MiB · C64 64KB Ring · VLAN 4010 · Zero Floats)",
@@ -3458,17 +3564,42 @@ fn main() {
         spawn_continuous_improver_thread(Arc::clone(&shared));
     }
 
-    for stream in listener.incoming().flatten() {
-        let state_clone = Arc::clone(&shared);
-        thread::spawn(move || {
-            handle_http_connection(stream, state_clone);
-        });
-    }
+    let workers = thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16));
+    http::serve(listener.incoming(), workers, |stream, bytes| {
+        handle_http_connection(stream, bytes, Arc::clone(&shared));
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_request_leaves_single_worker_available() {
+        use std::io::Read;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(A6000OrchestratorState::new()));
+        thread::scope(|scope| {
+            scope.spawn(|| http::serve(listener.incoming().take(2), 1, |s, bytes| {
+                handle_http_connection(s, bytes, Arc::clone(&state));
+            }));
+            let mut slow = TcpStream::connect(address).unwrap();
+            slow.write_all(b"POST /unknown HTTP/1.1\r\nContent-Length: 4\r\n\r\nab").unwrap();
+            let mut fast = TcpStream::connect(address).unwrap();
+            fast.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            fast.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            fast.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 200") && reply.contains("a6000-orchestrator"));
+            slow.write_all(b"cd").unwrap();
+            reply.clear();
+            slow.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 404"));
+        });
+    }
 
     #[test]
     fn test_all_json_and_html_outputs_strictly_zero_floats() {
@@ -3655,7 +3786,45 @@ mod tests {
             "Float literal found in chat_json: {}",
             chat_json
         );
+
+        let watchdog_json = render_watchdog_json(&mut state, true, false, None);
+        assert!(watchdog_json.contains("\"subsystem\":\"K_sovereign_fleet_watchdog_and_auto_healer\""));
+        assert_eq!(
+            count_floating_point_literals(&watchdog_json),
+            0,
+            "Float literal found in watchdog_json: {}",
+            watchdog_json
+        );
     }
+    #[test]
+    fn watchdog_http_reads_and_denied_controls_never_run_a_check() {
+        for request in [
+            "GET /api/watchdog/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /api/watchdog/heal?target=all HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "POST /api/watchdog/heal HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let state = Arc::new(Mutex::new(A6000OrchestratorState::new()));
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let shared = Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                handle_http_connection(stream, request.as_bytes().to_vec(), shared);
+            });
+            let mut connection = TcpStream::connect(address).unwrap();
+            connection.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut response = String::new();
+            std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+            worker.join().unwrap();
+            let expected = if request.starts_with("GET /api/watchdog/status") { "HTTP/1.1 200" }
+                else if request.starts_with("GET") { "HTTP/1.1 405" } else { "HTTP/1.1 403" };
+            assert!(response.starts_with(expected), "{response}");
+            let state = state.lock().unwrap();
+            assert_eq!(state.watchdog_check_counter, 0);
+            assert_eq!(state.watchdog_heal_counter, 0);
+        }
+    }
+
 }
 
 

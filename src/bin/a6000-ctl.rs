@@ -137,6 +137,8 @@ fn print_usage() {
     println!("  commitments         Subsystem I: Inspect MEM|8 16-Byte Normative Commitments & 3-Op Continuation Guard");
     println!("  commitment-transition [id] [state] [justification] [sig]  Subsystem I: Transition MEM|8 Commitment");
     println!("  wici                Subsystem J: WiCi Wireless GPU & DeepSeek-671B MoE 3-Tier Orchestration (A6000 + RTX 4090)");
+    println!("  watchdog            Subsystem K: Continuous Fleet Availability Watchdog Check + Auto-Fix Engine");
+    println!("  heal [target]       Subsystem K: Force Auto-Fix Playbook Pass on Target Service/Tunnel");
 }
 
 fn main() {
@@ -206,6 +208,15 @@ fn main() {
         "domains-reconcile" => ("POST", "/a6000/api/domains/reconcile".to_string()),
         "commitments" => ("GET", "/a6000/api/commitments".to_string()),
         "wici" | "wici-moe" => ("GET", "/a6000/api/wici".to_string()),
+        "watchdog" | "watchdog-check" => ("POST", "/a6000/api/watchdog/check".to_string()),
+        "watchdog-status" => ("GET", "/a6000/api/watchdog/status".to_string()),
+        "heal" | "watchdog-heal" => {
+            if let Some(t) = args.get(2).map(|s| sanitize_arg(s)).filter(|s| !s.is_empty()) {
+                ("POST", format!("/a6000/api/watchdog/heal?target={}", t))
+            } else {
+                ("POST", "/a6000/api/watchdog/heal".to_string())
+            }
+        }
         "commitment-transition" | "transition" => {
             let id = args.get(2).map(|s| url_encode_param(s)).unwrap_or_default();
             let st = args.get(3).map(|s| url_encode_param(s)).unwrap_or_default();
