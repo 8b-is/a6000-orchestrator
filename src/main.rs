@@ -3,7 +3,8 @@
 //! Centered on `49.13.101.247` (`cheet.is` · `a6000.8b.is` · `g6k2.nue.8s.is` · RTX 6000 Ada).
 
 use a6000_orchestrator::*;
-use std::io::{Read, Write};
+mod http;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -1861,7 +1862,7 @@ pub fn execute_wici_foken_chat(
         .or_else(|| extract_json_string_field(req_body, "prompt"))
         .or_else(|| extract_json_string_field(req_body, "content"))
         .unwrap_or_else(|| {
-            "Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts from NVMe SSD with zero floats".to_string()
+            "Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts from NVMe SSD".to_string()
         });
     let active_model = state.wici_foken_registry.active_model_id.clone();
     let default_reply = format!(
@@ -2050,7 +2051,6 @@ pub fn render_foken_wici_dashboard_html() -> &'static str {
       Workstation RTX 4090 (24564 MiB VRAM + 125 GiB RAM + 1843200 MiB T-FORCE NVMe) + /data/wici-ai/inferssd
     </div>
     <div class="badge-bar">
-      <span class="badge badge-green">Zero-Float Law (float_count = 0)</span>
       <span class="badge badge-gold">Foken Shared GPU Economy (Earn &amp; Spend FKN)</span>
       <span class="badge badge-green">Honest Live Presence (300s Announcement TTL)</span>
       <span class="badge">wici-ai/inferssd (763B DeepSeek V4·1 &amp; 816B Muse Spark)</span>
@@ -2169,7 +2169,7 @@ pub fn render_foken_wici_dashboard_html() -> &'static str {
   <div class="card">
     <h2>5 · LOCAL ASSISTANT CHAT &amp; LIVE ssd·place·layer / io_uring EXPERT TELEMETRY</h2>
     <div class="btn-row">
-      <input type="text" id="chat-prompt" value="Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts over Wi-Fi with zero floats" />
+      <input type="text" id="chat-prompt" value="Explain how WiCi InferSSD + Foken shared GPUs stream 763B MoE experts over Wi-Fi" />
       <button class="btn-teal" onclick="sendFokenChat()">Run Shared GPU Inference (4 FKN)</button>
     </div>
     <pre id="chat-output">Ready — send a prompt above or click any model/device action to inspect live ssd·place·layer &amp; Foken ledger telemetry.</pre>
@@ -2462,7 +2462,6 @@ pub fn render_command_deck_html() -> &'static str {
     </div>
     <div class="badge-bar">
       <span class="badge badge-green">100% Pure Rust · #![forbid(unsafe_code)]</span>
-      <span class="badge badge-green">Strict 8b·is No-Float Law (float_count = 0)</span>
       <span class="badge badge-green">RTX 6000 Ada Resident (keep_alive = -1)</span>
       <span class="badge">Hetzner VLAN 4010 (vSwitch #71596 · 160 TB Link)</span>
       <span class="badge">Namecheap lumisst + ns1..ns4·i1·is Reconciler</span>
@@ -2882,54 +2881,11 @@ fn url_encode_query_val(raw: &str) -> String {
     out
 }
 
-fn read_http_request_bytes(stream: &mut TcpStream) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 4096];
-    let mut header_end: Option<usize> = None;
-    let mut content_length: usize = 0;
-
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let end = pos + 4;
-                        header_end = Some(end);
-                        let hdr_str = String::from_utf8_lossy(&buf[..end]);
-                        for line in hdr_str.lines() {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.trim().eq_ignore_ascii_case("content-length") {
-                                    content_length = v.trim().parse::<usize>().unwrap_or(0).min(16384);
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(end) = header_end {
-                    if buf.len() >= end.saturating_add(content_length) || buf.len() >= 16384 {
-                        break;
-                    }
-                } else if buf.len() >= 16384 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    buf
-}
-
-fn handle_http_connection(mut stream: TcpStream, state: Arc<Mutex<A6000OrchestratorState>>) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-
-    let raw_bytes = read_http_request_bytes(&mut stream);
-    if raw_bytes.is_empty() {
+fn handle_http_connection(mut stream: TcpStream, raw_bytes: Vec<u8>, state: Arc<Mutex<A6000OrchestratorState>>) {
+    if stream.set_nonblocking(false).is_err() {
         return;
     }
-
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let req_str = String::from_utf8_lossy(&raw_bytes);
     let req_body = req_str.split("\r\n\r\n").nth(1).unwrap_or("").trim();
     let first_line = req_str.lines().next().unwrap_or("GET / HTTP/1.1");
@@ -3581,17 +3537,42 @@ fn main() {
         spawn_continuous_improver_thread(Arc::clone(&shared));
     }
 
-    for stream in listener.incoming().flatten() {
-        let state_clone = Arc::clone(&shared);
-        thread::spawn(move || {
-            handle_http_connection(stream, state_clone);
-        });
-    }
+    let workers = thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 16));
+    http::serve(listener.incoming(), workers, |stream, bytes| {
+        handle_http_connection(stream, bytes, Arc::clone(&shared));
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_request_leaves_single_worker_available() {
+        use std::io::Read;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(A6000OrchestratorState::new()));
+        thread::scope(|scope| {
+            scope.spawn(|| http::serve(listener.incoming().take(2), 1, |s, bytes| {
+                handle_http_connection(s, bytes, Arc::clone(&state));
+            }));
+            let mut slow = TcpStream::connect(address).unwrap();
+            slow.write_all(b"POST /unknown HTTP/1.1\r\nContent-Length: 4\r\n\r\nab").unwrap();
+            let mut fast = TcpStream::connect(address).unwrap();
+            fast.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            fast.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+            let mut reply = String::new();
+            fast.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 200") && reply.contains("a6000-orchestrator"));
+            slow.write_all(b"cd").unwrap();
+            reply.clear();
+            slow.read_to_string(&mut reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 404"));
+        });
+    }
 
     #[test]
     fn test_all_json_and_html_outputs_strictly_zero_floats() {
