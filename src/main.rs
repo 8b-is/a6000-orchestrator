@@ -4,6 +4,7 @@
 
 use a6000_orchestrator::*;
 mod http;
+mod watchdog_control;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
@@ -1385,6 +1386,7 @@ pub fn render_watchdog_json(
         if let Some(ref cached) = state.last_watchdog_report {
             return cached.to_json();
         }
+        return "{\"ok\":true,\"state\":\"not_checked\",\"targets\":[]}".to_owned();
     }
     state.watchdog_check_counter = state.watchdog_check_counter.saturating_add(1);
     let rep = run_watchdog_check_and_heal_pass(
@@ -2489,9 +2491,10 @@ pub fn render_command_deck_html() -> &'static str {
       <button class="btn-amber" onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=true')">[12] Announce blu-g75 Online (+25 FKN)</button>
       <button onclick="runAction('/a6000/api/wici/announce?device_id=blu-g75&amp;kind=wireless&amp;online=false')">[13] Set blu-g75 Offline [0]</button>
       <button class="btn-teal" onclick="window.location.href='/a6000/foken'">[14] Open Foken·ai × WiCi InferSSD Dashboard</button>
-      <button class="btn-teal" onclick="runAction('/a6000/api/watchdog/check')">[15] Run Fleet Availability Watchdog Check + Auto-Fix</button>
-      <button class="btn-amber" onclick="runAction('/a6000/api/watchdog/heal')">[16] Force Auto-Fix Playbook Pass</button>
+      <button class="btn-teal" onclick="runWatchdogAction('/a6000/api/watchdog/check')">[15] Check Fleet Availability</button>
+      <button class="btn-amber" onclick="runWatchdogAction('/a6000/api/watchdog/heal')">[16] Run Recovery Playbook</button>
     </div>
+    <label>Watchdog control key <input id="watchdog-control-key" type="password" autocomplete="off" minlength="32"></label>
     <pre id="action-output">Ready — click any orchestration command above or inspect live subsystems below.</pre>
   </div>
 
@@ -2629,6 +2632,16 @@ async function fetchJson(path, method) {
   return await res.json();
 }
 
+async function runWatchdogAction(path) {
+  const input = document.getElementById('watchdog-control-key');
+  const output = document.getElementById('action-output');
+  if (input.value.length < 32) { output.textContent = 'Enter your watchdog control key first.'; return; }
+  try {
+    const response = await fetch(path, {method: 'POST', headers: {'Authorization': 'Bearer ' + input.value}});
+    output.textContent = await response.text();
+  } catch (error) { output.textContent = String(error); }
+  finally { input.value = ''; }
+}
 async function runAction(path) {
   const out = document.getElementById('action-output');
   out.textContent = 'Executing ' + path + ' on 49.13.101.247 (RTX 6000 Ada)...';
@@ -2896,7 +2909,19 @@ fn handle_http_connection(mut stream: TcpStream, raw_bytes: Vec<u8>, state: Arc<
     let raw_path = parts.next().unwrap_or("/");
     let path = raw_path.split('?').next().unwrap_or("/");
 
+    let configured_token = std::env::var("A6000_WATCHDOG_CONTROL_TOKEN").ok();
+    let control_error = if watchdog_control::is_control_path(path) {
+        watchdog_control::authorize(raw_method, &req_str, configured_token.as_deref()).err()
+    } else {
+        None
+    };
     let (status_line, content_type, body) = match (method, path) {
+        _ if control_error.is_some() => {
+            let reason = control_error.unwrap();
+            let status = if reason == "method_not_allowed" { "HTTP/1.1 405 Method Not Allowed" } else { "HTTP/1.1 403 Forbidden" };
+            (status, "application/json; charset=utf-8", format!("{{\"ok\":false,\"error\":\"{reason}\"}}"))
+        }
+
         ("OPTIONS", _) => (
             "HTTP/1.1 204 No Content",
             "text/plain; charset=utf-8",
@@ -3289,12 +3314,12 @@ fn handle_http_connection(mut stream: TcpStream, raw_bytes: Vec<u8>, state: Arc<
         | ("GET", "/a6000/api/watchdog/status")
         | ("GET", "/api/watchdog/status") => {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            let json = render_watchdog_json(&mut guard, false, true, None);
+            let json = render_watchdog_json(&mut guard, false, false, None);
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
         (_, "/a6000/api/watchdog/check") | (_, "/api/watchdog/check") => {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            let json = render_watchdog_json(&mut guard, true, true, None);
+            let json = render_watchdog_json(&mut guard, true, false, None);
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
         (_, "/a6000/api/watchdog/heal") | (_, "/api/watchdog/heal") => {
@@ -3367,7 +3392,8 @@ fn spawn_continuous_improver_thread(shared: Arc<Mutex<A6000OrchestratorState>>) 
                 let sync_rep = sync_github_owner_io("8b-is", 25);
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.last_borg_sync_report = Some(sync_rep);
-                let _ = render_watchdog_json(&mut guard, true, true, None);
+                let auto_heal = std::env::var("A6000_WATCHDOG_AUTO_HEAL").is_ok_and(|value| value == "1");
+                let _ = render_watchdog_json(&mut guard, true, auto_heal, None);
             }
         }
 
@@ -3375,7 +3401,8 @@ fn spawn_continuous_improver_thread(shared: Arc<Mutex<A6000OrchestratorState>>) 
             thread::sleep(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS));
             {
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = render_watchdog_json(&mut guard, true, true, None);
+                let auto_heal = std::env::var("A6000_WATCHDOG_AUTO_HEAL").is_ok_and(|value| value == "1");
+                let _ = render_watchdog_json(&mut guard, true, auto_heal, None);
             }
             let (cid, nonce, bid, bnonce) = {
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -3476,7 +3503,7 @@ fn main() {
             return;
         }
         "watchdog" | "watchdog-check" => {
-            println!("{}", render_watchdog_json(&mut init_state, true, true, None));
+            println!("{}", render_watchdog_json(&mut init_state, true, false, None));
             return;
         }
         "watchdog-heal" | "heal" => {
@@ -3521,7 +3548,7 @@ fn main() {
     let _ = verify_backup_vaults(&mut init_state);
     let _ = render_domains_json(&mut init_state, true, None, None);
 
-    let bind_addr = std::env::var("A6000_BIND").unwrap_or_else(|_| "0.0.0.0:8790".to_string());
+    let bind_addr = std::env::var("A6000_BIND").unwrap_or_else(|_| "127.0.0.1:8790".to_string());
     let listener = TcpListener::bind(&bind_addr).expect("Failed to bind A6000 orchestrator port");
     println!(
         "[a6000-orchestrator] Listening on http://{} (RTX 6000 Ada · 49140 MiB · C64 64KB Ring · VLAN 4010 · Zero Floats)",
@@ -3769,6 +3796,35 @@ mod tests {
             watchdog_json
         );
     }
+    #[test]
+    fn watchdog_http_reads_and_denied_controls_never_run_a_check() {
+        for request in [
+            "GET /api/watchdog/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /api/watchdog/heal?target=all HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "POST /api/watchdog/heal HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let state = Arc::new(Mutex::new(A6000OrchestratorState::new()));
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let shared = Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                handle_http_connection(stream, request.as_bytes().to_vec(), shared);
+            });
+            let mut connection = TcpStream::connect(address).unwrap();
+            connection.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut response = String::new();
+            std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+            worker.join().unwrap();
+            let expected = if request.starts_with("GET /api/watchdog/status") { "HTTP/1.1 200" }
+                else if request.starts_with("GET") { "HTTP/1.1 405" } else { "HTTP/1.1 403" };
+            assert!(response.starts_with(expected), "{response}");
+            let state = state.lock().unwrap();
+            assert_eq!(state.watchdog_check_counter, 0);
+            assert_eq!(state.watchdog_heal_counter, 0);
+        }
+    }
+
 }
 
 

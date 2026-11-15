@@ -32,3 +32,15 @@ Centered on the **`NVIDIA RTX 6000 Ada Generation`** (`49140 MiB` VRAM, `48`-vCP
 | **H — Namecheap (`lumisst`) & `ns1..ns4.i1.is` Controller** | `GET /api/a6000/domains` · `POST /api/a6000/domains/reconcile` | `a6000-ctl domains` · `a6000-ctl domains reconcile` | Pure-Rust Namecheap XML parser (`getList`, `getBalances`, `setCustom`, `check`, `create`) + authoritative `/etc/i1-dns/zones` reconciler across `ns1..ns4.i1.is` |
 | **I — `MEM|8` Normative Commitment Kernel** | `GET /api/a6000/commitments` · `POST /api/a6000/commitments/transition` | `a6000-ctl commitments` · `a6000-ctl commitment-transition` | `16`-byte compact `NormativeCommitment` frame (`Proposed -> Accepted -> Active -> Fulfilled | Renegotiated | Released | Violated`), informational decay vs. `1/1` normative persistence, and 3-Operation Continuation Guard (`Prediction`, `Reasoning`, `Creation`: "a new door on the right side") |
 
+
+### Watchdog control
+
+The HTTP listener defaults to `127.0.0.1:8790`. Public status requests only return
+cached observations. Checks and recovery require POST plus a Bearer token matching
+`A6000_WATCHDOG_CONTROL_TOKEN` (at least 32 non-whitespace bytes); without that
+configuration HTTP control is disabled. Enter the key in the dashboard only over
+a trusted HTTPS connection. It is cleared after each request and is not stored.
+
+Background recovery is opt-in with `A6000_WATCHDOG_AUTO_HEAL=1`; otherwise the
+background watchdog only checks health. The local `watchdog` CLI checks without
+restarting services, while `watchdog-heal` explicitly requests recovery.
