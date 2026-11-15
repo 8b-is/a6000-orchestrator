@@ -8420,12 +8420,24 @@ pub fn probe_watchdog_target(spec: &WatchdogTargetSpec) -> (bool, u64, String) {
     if spec.http_path == "tunnel:8790" {
         // Verify both TCP 22 on 5.78.220.57 AND that 127.0.0.1:8790 is listening on 5.78.220.57
         let start = Instant::now();
-        let (tcp_ok, rtt_us) = probe_tcp_rtt_us(spec.node_ip, 80, 700);
-        if !tcp_ok {
-            return (false, rtt_us, "EDGE_PORT_80_UNREACHABLE".to_string());
-        }
+        // Probe the remote loopback listener, not the public web server.
+        let result = Command::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=4",
+                "-o", "ControlPath=none",
+                "-o", "StrictHostKeyChecking=yes",
+                &format!("root@{}", spec.node_ip),
+                "systemctl is-active --quiet a6000-orchestrator-tunnel.service && ss -H -ltn '( sport = :8790 )' | grep -q .",
+            ])
+            .output();
         let elapsed = (start.elapsed().as_micros() as u64).max(1);
-        return (true, elapsed, "TUNNEL_AND_EDGE_ACTIVE".to_string());
+        let ok = result.map(|out| out.status.success()).unwrap_or(false);
+        return (ok, elapsed, if ok {
+            "REMOTE_TUNNEL_LISTENER_ACTIVE".to_string()
+        } else {
+            "REMOTE_TUNNEL_LISTENER_UNVERIFIED".to_string()
+        });
     }
 
     let (ok, rtt_us) = probe_tcp_rtt_us(spec.node_ip, spec.port, 750);
@@ -8450,12 +8462,12 @@ pub fn execute_watchdog_auto_heal(
     let timestamp_secs = now_epoch_secs();
     let _ = clean_stale_ssh_control_sockets();
 
-    if spec.is_local_loopback {
-        let _ = Command::new("sh")
+    let command_result = if spec.is_local_loopback {
+        Command::new("sh")
             .args(["-c", spec.auto_fix_command])
-            .output();
+            .output()
     } else {
-        let _ = Command::new("ssh")
+        Command::new("ssh")
             .args([
                 "-o",
                 "BatchMode=yes",
@@ -8464,15 +8476,19 @@ pub fn execute_watchdog_auto_heal(
                 "-o",
                 "ControlPath=none",
                 "-o",
-                "StrictHostKeyChecking=accept-new",
+                "StrictHostKeyChecking=yes",
                 &format!("root@{}", spec.node_ip),
                 spec.auto_fix_command,
             ])
-            .output();
-    }
+            .output()
+    };
 
-    std::thread::sleep(Duration::from_millis(600));
-    let (verified_fixed, _, _) = probe_watchdog_target(spec);
+    let command_succeeded = command_result.map(|out| out.status.success()).unwrap_or(false);
+    if command_succeeded {
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    let (probe_ok, _, _) = probe_watchdog_target(spec);
+    let verified_fixed = command_succeeded && probe_ok;
     let recovery_duration_ms = (start.elapsed().as_millis() as u64).max(1);
     let after_trit = if verified_fixed { Trit::Pos } else { Trit::Neg };
 
@@ -8535,7 +8551,13 @@ pub fn run_watchdog_check_and_heal_pass(
             .map(|f| f == spec.target_id || f == spec.service_name || f == "all")
             .unwrap_or(false);
 
-        if (!ok || forced) && auto_heal_enabled {
+        // Limit autonomous restarts to one attempt per target per five minutes.
+        // The ring buffer also records unsuccessful attempts.
+        let in_cooldown = heal_ring.to_vec().iter().any(|event| {
+            event.target_id == spec.target_id
+                && now_secs.saturating_sub(event.timestamp_secs) < 300
+        });
+        if (!ok || forced) && auto_heal_enabled && !in_cooldown {
             fix_mode_engaged = true;
             *next_heal_id = next_heal_id.saturating_add(1);
             let reason = if forced && ok {
