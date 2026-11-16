@@ -2114,7 +2114,7 @@ pub fn render_foken_wici_dashboard_html() -> &'static str {
       <button class="btn-teal" onclick="announceDevice('galaxy-s24-ultra','wireless-client',true)">Announce galaxy-s24-ultra (+25 FKN)</button>
       <button class="btn-teal" onclick="announceDevice('raspberry-pi-5-16gb','wireless-client',true)">Announce raspberry-pi-5-16gb (+25 FKN)</button>
       <button class="btn-teal" onclick="announceDevice('tdeck-omni-esp32s3','wireless-client',true)">Announce tdeck-omni-esp32s3 (+25 FKN)</button>
-      <button class="btn-amber" onclick="announceDevice('local-rtx4090-tforce','gpu',true)">Announce Local RTX 4090 + T-FORCE NVMe (+50 FKN)</button>
+      <button class="btn-amber" onclick="announceDevice('local-rtx4090-tforce','gpu',true)">Announce Local RTX 4090 + T-FORCE NVMe</button>
     </div>
     <div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">
       <b>CLI / Phone Announcement Command:</b>
