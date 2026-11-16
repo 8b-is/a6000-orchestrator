@@ -1771,7 +1771,7 @@ pub fn execute_wici_foken_announce(
         });
 
     let now_s = now_epoch_secs();
-    let announced_json = state.wici_foken_registry.announce_device(
+    let mut announced_json = state.wici_foken_registry.announce_device(
         &device_id,
         &device_kind,
         online,
@@ -1786,6 +1786,26 @@ pub fn execute_wici_foken_announce(
         nvme_ssd_vault_mib,
         now_s,
     );
+    // Optional provider-reported metadata; presence is not proof of paid work.
+    if let Some(gpu) = state.wici_foken_registry.shared_gpus.iter_mut()
+        .find(|gpu| gpu.provider_id.eq_ignore_ascii_case(device_id.trim()))
+    {
+        if let Some(model) = extract_json_string_field(req_body, "active_model_id") {
+            gpu.active_model_id = model.chars().take(160).collect();
+        }
+        if req_body.contains("\"jobs_completed\"") {
+            gpu.jobs_completed = extract_json_u64(req_body, "jobs_completed", gpu.jobs_completed);
+        }
+        // Zero is meaningful: exhausted memory or no SSD vault configured.
+        if req_body.contains("\"vram_free_mib\"") {
+            gpu.vram_free_mib = extract_json_u64(req_body, "vram_free_mib", gpu.vram_free_mib)
+                .min(gpu.vram_total_mib);
+        }
+        if req_body.contains("\"nvme_ssd_vault_mib\"") {
+            gpu.nvme_ssd_vault_mib = extract_json_u64(req_body, "nvme_ssd_vault_mib", gpu.nvme_ssd_vault_mib);
+        }
+        announced_json = gpu.to_json();
+    }
     state.c64_page.write_record(&format!(
         "WICI_FOKEN_ANNOUNCE:ID={}:KIND={}:ONLINE={}:FOKENS={}",
         device_id,
@@ -2179,6 +2199,10 @@ pub fn render_foken_wici_dashboard_html() -> &'static str {
 </div>
 
 <script>
+function htmlText(value) {
+  return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+}
 function tritClass(t) {
   if (t > 0) return 'trit-pos';
   if (t < 0) return 'trit-neg';
@@ -2273,17 +2297,18 @@ async function refreshFoken() {
       const btnLbl = g.online ? 'Set Offline' : 'Announce GPU';
       const btnCls = g.online ? 'btn-dark' : 'btn-teal';
       tr.innerHTML =
-        '<td><b>' + g.provider_id + '</b></td>' +
-        '<td>' + g.node_host + '</td>' +
-        '<td><b>' + g.gpu_model + '</b></td>' +
+        '<td><b>' + htmlText(g.provider_id) + '</b></td>' +
+        '<td>' + htmlText(g.node_host) + '</td>' +
+        '<td><b>' + htmlText(g.gpu_model) + '</b></td>' +
         '<td>' + g.vram_free_mib + ' / ' + g.vram_total_mib + ' MiB (' + g.vram_utilization_pq + ')</td>' +
         '<td>' + g.host_ram_mib + ' MiB</td>' +
         '<td>' + g.nvme_ssd_vault_mib + ' MiB</td>' +
         '<td>' + g.foken_rate_per_hour + ' FKN/hr</td>' +
-        '<td><b>' + g.fokens_earned + ' FKN</b> (' + g.jobs_completed + ' jobs)</td>' +
-        '<td><code>' + g.active_model_id + '</code></td>' +
-        '<td class="' + tritClass(g.provider_trit) + '">' + g.presence_state + ' [' + g.provider_trit_glyph + ']</td>' +
-        '<td><button class="' + btnCls + '" onclick="announceDevice(\'' + g.provider_id + '\',\'gpu\',' + nextOnline + ')">' + btnLbl + '</button></td>';
+        '<td><b>' + g.fokens_earned + ' FKN</b> (' + g.jobs_completed + ' reported jobs)</td>' +
+        '<td><code>' + htmlText(g.active_model_id) + '</code></td>' +
+        '<td class="' + tritClass(g.provider_trit) + '">' + htmlText(g.presence_state) + ' [' + g.provider_trit_glyph + ']<br>Last heartbeat: ' + (g.last_seen_epoch_secs ? new Date(Number(BigInt(g.last_seen_epoch_secs) * 1000n)).toISOString() : 'none') + '</td>' +
+        '<td><button class="' + btnCls + '">' + btnLbl + '</button></td>';
+      tr.querySelector('button').addEventListener('click', () => announceDevice(g.provider_id, 'gpu', nextOnline));
       gbody.appendChild(tr);
     }
 
@@ -3796,6 +3821,35 @@ mod tests {
             watchdog_json
         );
     }
+    #[test]
+    fn gpu_presence_reports_metadata_without_minting_work() {
+        let mut state = A6000OrchestratorState::new();
+        let circulation = state.wici_foken_registry.total_fokens_in_circulation;
+        let body = r#"{"device_id":"mac-studio-m1-ultra","device_kind":"gpu","online":true,"gpu_model":"Apple M1 Ultra","active_model_id":"qwen3.8:27b","host_ram_mib":131072,"vram_total_mib":110100,"vram_free_mib":0,"nvme_ssd_vault_mib":0,"jobs_completed":2}"#;
+        for _ in 0..3 {
+            let response = execute_wici_foken_announce(&mut state, "/api/foken/announce", body);
+            assert!(response.contains("qwen3"));
+            let gpu = state.wici_foken_registry.shared_gpus.iter()
+                .find(|gpu| gpu.provider_id == "mac-studio-m1-ultra").unwrap();
+            assert!(gpu.online);
+            assert_eq!(gpu.active_model_id, "qwen3.8:27b");
+            assert_eq!(gpu.host_ram_mib, 131072);
+            assert_eq!(gpu.vram_free_mib, 0);
+            assert_eq!(gpu.nvme_ssd_vault_mib, 0);
+            assert_eq!(gpu.jobs_completed, 2);
+            assert_eq!(gpu.fokens_earned, 0);
+            assert_eq!(state.wici_foken_registry.total_fokens_in_circulation, circulation);
+        }
+        let seen = state.wici_foken_registry.shared_gpus.last().unwrap().last_seen_epoch_secs;
+        state.wici_foken_registry.refresh_ttl(seen + 301);
+        assert!(!state.wici_foken_registry.shared_gpus.last().unwrap().online);
+        execute_wici_foken_announce(&mut state, "/api/foken/announce",
+            r#"{"device_id":"mac-studio-m1-ultra","device_kind":"gpu","online":false}"#);
+        let gpu = state.wici_foken_registry.shared_gpus.last().unwrap();
+        assert!(!gpu.online);
+        assert_eq!(gpu.jobs_completed, 2);
+    }
+
     #[test]
     fn watchdog_http_reads_and_denied_controls_never_run_a_check() {
         for request in [
