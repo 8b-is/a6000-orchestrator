@@ -44,3 +44,22 @@ a trusted HTTPS connection. It is cleared after each request and is not stored.
 Background recovery is opt-in with `A6000_WATCHDOG_AUTO_HEAL=1`; otherwise the
 background watchdog only checks health. The local `watchdog` CLI checks without
 restarting services, while `watchdog-heal` explicitly requests recovery.
+
+### Live GPU presence
+
+GPU announcements refresh a 300-second presence lease; they do not create
+completed jobs or mint Fokens. Providers may report `active_model_id` and
+`jobs_completed` with their hardware fields. These are provider-reported values,
+not independently attested results or a payment receipt. New providers default
+to zero jobs/earnings and an unreported model. Explicit zero free memory and
+zero configured SSD vault are retained. The dashboard displays the last
+heartbeat and escapes provider-supplied text.
+
+For temporary Apple providers, run a bounded supervisor on the Mac itself:
+start a loopback Foken coordinator and Metal provider, verify a real generation,
+then announce only while the worker, coordinator, and local model are healthy.
+Set an absolute stop deadline, send `online:false` during cleanup, and terminate
+only the processes owned by that supervisor. Keep Ollama and other user services
+intact. A registry announcement advertises presence; it does not wire the
+separate WiCi chat endpoint to the Foken job coordinator. Keep that distinction
+visible in the provider label.

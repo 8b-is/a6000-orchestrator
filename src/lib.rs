@@ -7756,7 +7756,7 @@ impl WiciFokenRegistry {
     }
 
     /// Announce (or disconnect) a wireless client (`device_kind = "wireless-client"`) or a shared GPU
-    /// provider (`device_kind = "gpu"`), minting Fokens on announcement.
+    /// provider (`device_kind = "gpu"`). GPU presence never mints Fokens or completes work.
     pub fn announce_device(
         &mut self,
         device_id: &str,
@@ -7812,11 +7812,7 @@ impl WiciFokenRegistry {
                     existing.online = true;
                     existing.presence_state = "ONLINE_ANNOUNCED".to_string();
                     existing.last_seen_epoch_secs = now_secs.max(1);
-                    existing.fokens_earned = existing.fokens_earned.saturating_add(50);
-                    existing.jobs_completed = existing.jobs_completed.saturating_add(1);
                     existing.provider_trit = Trit::Pos;
-                    self.total_fokens_in_circulation =
-                        self.total_fokens_in_circulation.saturating_add(50);
                 } else {
                     existing.online = false;
                     existing.presence_state = "OFFLINE_AWAITING_ANNOUNCEMENT".to_string();
@@ -7848,15 +7844,11 @@ impl WiciFokenRegistry {
                     },
                     last_seen_epoch_secs: if online { now_secs.max(1) } else { 0 },
                     foken_rate_per_hour: rate,
-                    fokens_earned: if online { 100 } else { 0 },
-                    jobs_completed: if online { 1 } else { 0 },
-                    active_model_id: self.active_model_id.clone(),
+                    fokens_earned: 0,
+                    jobs_completed: 0,
+                    active_model_id: "unreported".to_string(),
                     provider_trit: if online { Trit::Pos } else { Trit::Zero },
                 };
-                if online {
-                    self.total_fokens_in_circulation =
-                        self.total_fokens_in_circulation.saturating_add(100);
-                }
                 let j = new_gpu.to_json();
                 self.shared_gpus.push(new_gpu);
                 return j;
